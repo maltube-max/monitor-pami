@@ -22,8 +22,8 @@ EMAIL_PASS    = os.environ.get("EMAIL_PASSWORD", "")
 EMAIL_DESTINO = "cotizaciones@siprotec.com.ar"
 
 URLS_BUSCADOR = [
-    ("UGL",           "https://prestadores.pami.org.ar/result.php?c=7-5&par=2"),
-    ("Nivel Central", "https://prestadores.pami.org.ar/result.php?c=7-5&par=1"),
+    ("UGL",           "https://prestadores.pami.org.ar/result.php?c=7-5&par=2", "2"),
+    ("Nivel Central", "https://prestadores.pami.org.ar/result.php?c=7-5&par=1", "1"),
 ]
 
 PALABRAS_CLAVE = {
@@ -35,11 +35,10 @@ PALABRAS_CLAVE = {
     "Ken Valve":                   ["ken valve"],
 }
 
-# Textos que indican que es el formulario, no una fila de resultado
 IGNORAR_SI_CONTIENE = [
     "seleccione", "tipo de compra", "fecha desde", "fecha hasta",
     "aplicación de legislación", "compras menores", "concurso abreviado",
-    "licitación publica", "contratación directa", "descripción"
+    "licitación publica", "contratación directa", "descripción\nfecha"
 ]
 
 def normalizar(texto):
@@ -49,7 +48,6 @@ def normalizar(texto):
     return texto
 
 def es_fila_formulario(texto):
-    """Devuelve True si el texto es del formulario y no de un resultado real."""
     texto_norm = normalizar(texto)
     for ignorar in IGNORAR_SI_CONTIENE:
         if ignorar in texto_norm:
@@ -73,47 +71,33 @@ def iniciar_browser():
     opciones.add_argument("--disable-dev-shm-usage")
     opciones.add_argument("--disable-gpu")
     opciones.add_argument("--window-size=1920,1080")
+    # Configurar carpeta de descargas
+    prefs = {"download.default_directory": "/tmp/pami_downloads",
+             "download.prompt_for_download": False,
+             "plugins.always_open_pdf_externally": True}
+    opciones.add_experimental_option("prefs", prefs)
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=opciones)
 
-def construir_link_pliego(nro_compulsa, ejercicio, expediente, par):
-    """
-    Construye el link al pliego PDF basado en los datos de la fila.
-    PAMI usa el expediente para identificar el pliego.
-    """
-    links_candidatos = []
-    
-    if expediente:
-        links_candidatos += [
-            f"https://prestadores.pami.org.ar/compras_ver_pliego.php?exp={expediente}&par={par}",
-            f"https://prestadores.pami.org.ar/compras_download.php?exp={expediente}",
-            f"https://prestadores.pami.org.ar/download_pliego.php?expediente={expediente}",
-        ]
-    if nro_compulsa and ejercicio:
-        links_candidatos += [
-            f"https://prestadores.pami.org.ar/compras_ver_pliego.php?nro={nro_compulsa}&ejercicio={ejercicio}&par={par}",
-            f"https://prestadores.pami.org.ar/compras_download.php?nro={nro_compulsa}&ejercicio={ejercicio}",
-        ]
-    
-    return links_candidatos
-
-def intentar_descargar(links):
-    """Intenta descargar un PDF de una lista de URLs candidatas."""
-    headers = {"User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"}
-    for url in links:
-        try:
-            r = requests.get(url, timeout=10, headers=headers)
-            if r.status_code == 200:
-                content_type = r.headers.get("Content-Type", "")
-                if "pdf" in content_type.lower():
-                    print(f"  ✅ PDF descargado de: {url}")
-                    return url, r.content
-                elif len(r.content) > 10000:  # archivo grande aunque no diga pdf
-                    print(f"  ✅ Archivo descargado de: {url}")
-                    return url, r.content
-        except:
-            pass
-    return "", None
+def obtener_url_desde_onclick(onclick_str):
+    """Extrae la URL de un string onclick de PAMI."""
+    if not onclick_str:
+        return ""
+    # Patrones comunes en PAMI
+    patrones = [
+        r"window\.open\(['\"]([^'\"]+)['\"]",
+        r"location\.href\s*=\s*['\"]([^'\"]+)['\"]",
+        r"href\s*=\s*['\"]([^'\"]+)['\"]",
+        r"['\"]([^'\"]*(?:pliego|ver|download|pdf|compra)[^'\"]*)['\"]",
+    ]
+    for patron in patrones:
+        m = re.search(patron, onclick_str, re.IGNORECASE)
+        if m:
+            url = m.group(1)
+            if not url.startswith("http"):
+                url = "https://prestadores.pami.org.ar/" + url.lstrip("/")
+            return url
+    return ""
 
 def obtener_compras(driver, nombre, url, par):
     print(f"\n--- {nombre} ---")
@@ -152,12 +136,10 @@ def obtener_compras(driver, nombre, url, par):
         filas = driver.find_elements(By.TAG_NAME, "tr")
         print(f"  Total filas: {len(filas)}")
 
-        for fila in filas:
+        for i, fila in enumerate(filas):
             texto_fila = fila.text.strip()
             if len(texto_fila) < 10:
                 continue
-
-            # IGNORAR filas del formulario
             if es_fila_formulario(texto_fila):
                 continue
 
@@ -165,61 +147,117 @@ def obtener_compras(driver, nombre, url, par):
             if not productos:
                 continue
 
-            print(f"\n  ✅ MATCH REAL: {texto_fila[:200]}")
+            print(f"\n  ✅ MATCH fila {i}: {texto_fila[:200]}")
 
-            # Extraer datos de la fila
-            # Formato típico: "569/26 Compulsa Abreviada UGL V Bahía Blanca 2026 48212040 DESCRIPCION 28/05/2026"
-            nro_compulsa = ""
+            # Extraer info
+            nro = ""
             ejercicio = ""
             expediente = ""
+            cierre = ""
+            ugl = ""
 
             m = re.search(r'(\d+)/(\d+)', texto_fila)
             if m:
-                nro_compulsa = m.group(1)
+                nro = m.group(1)
                 ejercicio = "20" + m.group(2) if len(m.group(2)) == 2 else m.group(2)
 
-            m = re.search(r'(\d{8,})', texto_fila)
+            m = re.search(r'\b(\d{8,})\b', texto_fila)
             if m:
                 expediente = m.group(1)
 
-            fecha_cierre = ""
             m = re.search(r'(\d{2}/\d{2}/\d{4})', texto_fila)
             if m:
-                fecha_cierre = m.group(1)
+                cierre = m.group(1)
 
-            # Extraer UGL
-            ugl = ""
-            m = re.search(r'UGL\s+(?:V|I+|X+)?\s*([\w\s]+?)(?:\d{4}|\n|$)', texto_fila, re.IGNORECASE)
+            m = re.search(r'UGL\s+(?:V+|I+|X+)?\s*([\w\s]+?)(?:\s\d{4}|\n|$)', texto_fila, re.IGNORECASE)
             if m:
                 ugl = m.group(1).strip()[:60]
 
-            info = {
-                "numero":  nro_compulsa,
-                "ejercicio": ejercicio,
-                "expediente": expediente,
-                "ugl":     ugl,
-                "cierre":  fecha_cierre,
-            }
+            desc = ""
+            m = re.search(r'((?:VALVULA|CLIP|SENTINEL|BIOADAPT|KEN|LUX)[\w\s\-–,/]+?)(?:\d{2}/\d{2}/\d{4}|remove_red_eye|$)', texto_fila, re.IGNORECASE)
+            if m:
+                desc = m.group(1).strip()[:150]
 
-            # Construir links candidatos al pliego
-            links_candidatos = construir_link_pliego(nro_compulsa, ejercicio, expediente, par)
-            print(f"  Links candidatos: {links_candidatos}")
+            # Buscar el ícono del ojo (remove_red_eye) en la fila
+            # y obtener su URL via onclick o href
+            link_ojo = ""
+            link_doc = ""
+            pdf_bytes = None
 
-            link_final, pdf_bytes = intentar_descargar(links_candidatos)
+            # Buscar todos los elementos clickeables en la fila
+            elementos_clickeables = fila.find_elements(By.XPATH, 
+                ".//*[@onclick] | .//a[@href] | .//i | .//span[@class] | .//button"
+            )
+            
+            for elem in elementos_clickeables:
+                tag = elem.tag_name
+                clase = elem.get_attribute("class") or ""
+                onclick = elem.get_attribute("onclick") or ""
+                href = elem.get_attribute("href") or ""
+                texto_elem = elem.text.strip()
+                
+                print(f"    Elem: tag={tag} class={clase} text={texto_elem} onclick={onclick[:100]} href={href[:100]}")
+                
+                # El ícono del ojo en Material Icons se llama "remove_red_eye" o "visibility"
+                if any(x in clase.lower() for x in ["eye", "ver", "visibility", "remove_red"]) or \
+                   any(x in texto_elem.lower() for x in ["remove_red_eye", "visibility"]) or \
+                   "remove_red_eye" in onclick:
+                    url_ojo = obtener_url_desde_onclick(onclick) or href
+                    if url_ojo:
+                        link_ojo = url_ojo
+                        print(f"    ✅ Link ojo: {link_ojo}")
 
-            # Si no encontramos el PDF, al menos damos el link al buscador con el número
+                # El ícono del documento se llama "description" en Material Icons
+                if any(x in clase.lower() for x in ["description", "doc", "file", "pdf"]) or \
+                   any(x in texto_elem.lower() for x in ["description"]) or \
+                   "description" in onclick:
+                    url_doc = obtener_url_desde_onclick(onclick) or href
+                    if url_doc:
+                        link_doc = url_doc
+                        print(f"    ✅ Link doc: {link_doc}")
+
+                # Cualquier onclick con URL
+                if onclick and not link_ojo:
+                    url_onclick = obtener_url_desde_onclick(onclick)
+                    if url_onclick and "result.php" not in url_onclick:
+                        link_ojo = url_onclick
+                        print(f"    ✅ Link onclick genérico: {link_ojo}")
+
+            # Usar link_ojo primero, si no link_doc
+            link_final = link_ojo or link_doc
+
+            # Si encontramos un link, intentar descargar
+            if link_final:
+                try:
+                    r = requests.get(link_final, timeout=20, headers={
+                        "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
+                    })
+                    if r.status_code == 200:
+                        ct = r.headers.get("Content-Type", "")
+                        if "pdf" in ct.lower() or "word" in ct.lower() or "octet" in ct.lower() or len(r.content) > 10000:
+                            pdf_bytes = r.content
+                            print(f"  ✅ Archivo descargado: {len(pdf_bytes)} bytes, tipo: {ct}")
+                except Exception as e:
+                    print(f"  Error descargando: {e}")
+
+            # Si no pudimos descargar, al menos guardamos el link
             if not link_final:
-                link_final = url
-                print(f"  No se pudo descargar el PDF — usando link al buscador")
+                link_final = url  # fallback al buscador
 
             resultados.append({
-                "texto_fila": texto_fila[:300],
-                "productos":  productos,
-                "info":       info,
-                "link":       link_final,
-                "es_pdf":     pdf_bytes is not None,
-                "pdf_bytes":  pdf_bytes,
-                "buscador":   nombre,
+                "desc":      desc,
+                "productos": productos,
+                "info": {
+                    "numero":     nro,
+                    "ejercicio":  ejercicio,
+                    "expediente": expediente,
+                    "ugl":        ugl,
+                    "cierre":     cierre,
+                },
+                "link":      link_final,
+                "es_pdf":    pdf_bytes is not None,
+                "pdf_bytes": pdf_bytes,
+                "buscador":  nombre,
             })
 
     except Exception as e:
@@ -231,19 +269,20 @@ def main():
     fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
     print(f"=== Monitor PAMI — {fecha} ===")
 
+    # Crear carpeta de descargas
+    os.makedirs("/tmp/pami_downloads", exist_ok=True)
+
     driver = iniciar_browser()
     resultados = []
     adjuntos = []
 
     try:
-        for nombre, url, par in [
-            ("UGL",           "https://prestadores.pami.org.ar/result.php?c=7-5&par=2", "2"),
-            ("Nivel Central", "https://prestadores.pami.org.ar/result.php?c=7-5&par=1", "1"),
-        ]:
+        for nombre, url, par in URLS_BUSCADOR:
             compras = obtener_compras(driver, nombre, url, par)
             for c in compras:
                 if c["pdf_bytes"] and len(adjuntos) < 5:
-                    n = f"pliego_{c['info'].get('numero', len(adjuntos)+1)}.pdf"
+                    ext = "pdf"
+                    n = f"pliego_{c['info'].get('numero', len(adjuntos)+1)}.{ext}"
                     adjuntos.append((n, c["pdf_bytes"]))
                 resultados.append(c)
     finally:
@@ -254,10 +293,8 @@ def main():
     resultados_unicos = []
     for r in resultados:
         key = r["info"].get("numero","") + r["info"].get("expediente","")
-        if key and key not in vistos:
+        if key not in vistos:
             vistos.add(key)
-            resultados_unicos.append(r)
-        elif not key:
             resultados_unicos.append(r)
 
     print(f"\n=== Total: {len(resultados_unicos)} resultado(s) ===")
@@ -295,23 +332,20 @@ def enviar_email_con_coincidencias(resultados, adjuntos, fecha):
         if info.get("numero"):     lineas.append(f"<b>Compulsa N°:</b> {info['numero']}/{info.get('ejercicio','')}")
         if info.get("ugl"):        lineas.append(f"<b>UGL:</b> {info['ugl']}")
         if info.get("cierre"):     lineas.append(f"<b>⚠️ Cierre:</b> {info['cierre']}")
-        if info.get("expediente"): lineas.append(f"<b>Expediente:</b> {info['expediente']}")
-        if r.get("texto_fila"):
-            # Mostrar solo la descripción, no todo el texto
-            desc = r['texto_fila']
-            # Buscar la parte de descripción
-            m = re.search(r'(VALVULA|CLIP|SENTINEL|BIOADAPT|KEN|LUX).*?(?=\d{2}/\d{2}/\d{4}|\Z)', desc, re.IGNORECASE)
-            if m:
-                lineas.append(f"<b>Descripción:</b> {m.group(0).strip()[:150]}")
+        if info.get("expediente"): lineas.append(f"<b>Expediente:</b> EX-{info.get('ejercicio','')}-{info['expediente']}-INSSJP")
+        if r.get("desc"):          lineas.append(f"<b>Descripción:</b> {r['desc']}")
         info_html = "<br>".join(lineas)
-        btn = ""
-        if r.get("link") and r.get("es_pdf"):
-            btn = f'<a href="{r["link"]}" class="btn btn-blue">📄 Descargar PDF</a>'
-        elif r.get("link"):
-            btn = f'<a href="{r["link"]}" class="btn btn-blue">🔗 Ver en PAMI</a>'
+
+        if r.get("es_pdf"):
+            btn = f'<a href="{r["link"]}" class="btn btn-blue">📄 Ver pliego</a>'
+        elif r.get("link") and "result.php" not in r["link"]:
+            btn = f'<a href="{r["link"]}" class="btn btn-blue">🔗 Ver pliego</a>'
+        else:
+            btn = f'<a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=2" class="btn btn-gray">🔗 Ver en PAMI</a>'
+
         cards += f'<div class="card"><div style="margin-bottom:10px">{tags}</div><p class="info">{info_html}</p>{btn}</div>'
 
-    adj_nota = f"<br><span style='font-size:13px;font-weight:normal'>📎 {len(adjuntos)} pliego(s) PDF adjunto(s)</span>" if adjuntos else ""
+    adj_nota = f"<br><span style='font-size:13px;font-weight:normal'>📎 {len(adjuntos)} pliego(s) adjunto(s) al email</span>" if adjuntos else ""
     html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">{ESTILO}</head><body>
     <div class="wrap">
       <div class="header"><h1>🏥 Monitor PAMI — Siprotec</h1><p>{fecha} | Revisión automática diaria</p></div>
