@@ -59,137 +59,174 @@ def iniciar_browser():
     opciones.add_argument("--disable-dev-shm-usage")
     opciones.add_argument("--disable-gpu")
     opciones.add_argument("--window-size=1920,1080")
-    opciones.add_argument("--lang=es-AR")
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=opciones)
 
 def obtener_compras(driver, nombre, url):
     print(f"\n--- {nombre} ---")
-    compras = []
+    resultados = []
 
     try:
         driver.get(url)
-        
-        # Esperar hasta 30 segundos a que desaparezca "Cargando"
         try:
             WebDriverWait(driver, 30).until(
-                lambda d: "Cargando" not in d.find_element(By.TAG_NAME, "body").text
-                or len(d.find_element(By.TAG_NAME, "body").text) > 2000
+                lambda d: len(d.find_element(By.TAG_NAME, "body").text) > 2000
             )
         except:
             pass
-        
         time.sleep(5)
 
-        # Intentar seleccionar "En curso" y buscar
+        # Seleccionar "En curso" y buscar
         try:
             select = Select(driver.find_element(By.NAME, "estado"))
             select.select_by_visible_text("En curso")
             time.sleep(1)
         except:
             pass
-
         try:
             btn = driver.find_element(By.XPATH,
-                "//input[@type='submit'] | //button[contains(text(),'Buscar')] | //input[@value='Buscar']"
-            )
+                "//input[@type='submit'] | //button[contains(text(),'Buscar')] | //input[@value='Buscar']")
             btn.click()
         except:
             pass
-
-        # Esperar que carguen los resultados — hasta 30 segundos
         try:
             WebDriverWait(driver, 30).until(
                 lambda d: len(d.find_element(By.TAG_NAME, "body").text) > 3000
             )
         except:
             pass
-
         time.sleep(5)
 
-        texto_pagina = driver.find_element(By.TAG_NAME, "body").text
-        print(f"  Texto obtenido: {len(texto_pagina)} chars")
-        print(f"  Primeros 500 chars: {texto_pagina[:500]}")
+        # Obtener el HTML completo de la página
+        html_pagina = driver.page_source
+        print(f"  HTML obtenido: {len(html_pagina)} chars")
 
-        # Buscar todos los links
-        links = driver.find_elements(By.TAG_NAME, "a")
-        links_docs = []
-        for link in links:
-            href = link.get_attribute("href") or ""
-            if any(x in href.lower() for x in ["pdf","pliego","compra","download","archivo","ver","adjunto","doc","569","result"]):
-                if href and href not in links_docs and "caducidad" not in href and "reglamento" not in href and "marco_regulatorio" not in href:
-                    links_docs.append(href)
+        # Buscar TODOS los links a pliegos en el HTML
+        # PAMI usa patrones como: ver_pliego.php, compras_ver, download, etc.
+        patrones_pliego = [
+            r'href=["\']([^"\']*(?:pliego|ver_pliego|download|adjunto|compras_ver)[^"\']*)["\']',
+            r'href=["\']([^"\']*compraselectronicas\.pami\.org\.ar[^"\']*\.pdf)["\']',
+            r'href=["\']([^"\']*\.pdf)["\']',
+            r'onclick=["\'][^"\']*window\.open\(["\']([^"\']+)["\']',
+        ]
 
-        print(f"  Links de compras: {len(links_docs)}")
-        for l in links_docs:
+        todos_links_pliego = []
+        for patron in patrones_pliego:
+            matches = re.findall(patron, html_pagina, re.IGNORECASE)
+            for m in matches:
+                if m not in todos_links_pliego:
+                    if not m.startswith("http"):
+                        m = "https://prestadores.pami.org.ar/" + m.lstrip("/")
+                    todos_links_pliego.append(m)
+
+        print(f"  Links a pliegos: {len(todos_links_pliego)}")
+        for l in todos_links_pliego[:10]:
             print(f"    {l}")
 
-        # Buscar en texto de la página
-        productos = detectar_productos(texto_pagina)
-        if productos:
-            info = extraer_info(texto_pagina)
-            compras.append({
-                "link": url, "es_pdf": False,
-                "productos": productos, "info": info,
-                "buscador": nombre, "pdf_bytes": None,
-            })
-            print(f"  ✅ En página: {', '.join(productos)}")
+        # Buscar filas de tabla que contengan palabras clave
+        filas = driver.find_elements(By.TAG_NAME, "tr")
+        print(f"  Total filas: {len(filas)}")
 
-        # Revisar cada documento
-        for href in links_docs[:30]:
-            try:
-                print(f"  Revisando: {href}")
-                r = requests.get(href, timeout=15, headers={
-                    "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
-                })
-                if r.status_code != 200:
-                    continue
-                content_type = r.headers.get("Content-Type","")
-                texto_doc = ""
-                bytes_doc = None
-                if "pdf" in content_type.lower() or href.lower().endswith(".pdf"):
-                    try:
-                        from pdfminer.high_level import extract_text as pdf_extract
-                        texto_doc = pdf_extract(io.BytesIO(r.content))
-                        bytes_doc = r.content
-                    except:
-                        texto_doc = r.content.decode("latin-1", errors="ignore")
-                        bytes_doc = r.content
-                else:
-                    texto_doc = re.sub(r'<[^>]+>', ' ', r.text)
-                    texto_doc = re.sub(r'\s+', ' ', texto_doc).strip()
+        for fila in filas:
+            texto_fila = fila.text.strip()
+            if len(texto_fila) < 10:
+                continue
 
-                productos = detectar_productos(texto_doc)
-                if productos:
-                    info = extraer_info(texto_doc)
-                    compras.append({
-                        "link": href, "es_pdf": bytes_doc is not None,
-                        "productos": productos, "info": info,
-                        "buscador": nombre, "pdf_bytes": bytes_doc,
+            productos = detectar_productos(texto_fila)
+            if not productos:
+                continue
+
+            print(f"\n  ✅ FILA CON MATCH: {texto_fila[:300]}")
+
+            # Extraer info de la fila
+            info = {}
+
+            # Número de compulsa (ej: 569/26)
+            m = re.search(r'(\d+)/\d+', texto_fila)
+            if m: info["numero"] = m.group(1)
+
+            # UGL
+            m = re.search(r'UGL\s+(?:V|I+)?\s*([\w\s]+?)(?:\n|$)', texto_fila, re.IGNORECASE)
+            if m: info["ugl"] = m.group(1).strip()[:60]
+
+            # Fecha cierre
+            m = re.search(r'(\d{2}/\d{2}/\d{4})', texto_fila)
+            if m: info["cierre"] = m.group(1)
+
+            # Email
+            m = re.search(r'[\w.\-]+@pami\.org\.ar', texto_fila.lower())
+            if m: info["email_contacto"] = m.group(0)
+
+            # Buscar links dentro de esta fila específica
+            links_fila = fila.find_elements(By.TAG_NAME, "a")
+            hrefs_fila = []
+            for a in links_fila:
+                href = a.get_attribute("href") or ""
+                onclick = a.get_attribute("onclick") or ""
+                if href and "result.php" not in href:
+                    hrefs_fila.append(href)
+                # Buscar en onclick
+                m_onclick = re.search(r"window\.open\(['\"]([^'\"]+)['\"]", onclick)
+                if m_onclick:
+                    hrefs_fila.append(m_onclick.group(1))
+
+            print(f"  Links en fila: {hrefs_fila}")
+
+            # Buscar también en el HTML de la fila
+            html_fila = fila.get_attribute("innerHTML") or ""
+            links_html_fila = re.findall(r'href=["\']([^"\']+)["\']', html_fila)
+            onclick_links = re.findall(r"window\.open\(['\"]([^'\"]+)['\"]", html_fila)
+            todos_links_fila = hrefs_fila + onclick_links
+            for l in links_html_fila:
+                if l not in todos_links_fila and "result.php" not in l:
+                    todos_links_fila.append(l)
+
+            print(f"  Todos links fila: {todos_links_fila}")
+
+            # Elegir el mejor link
+            link_final = ""
+            pdf_bytes = None
+
+            for href in todos_links_fila:
+                if not href.startswith("http"):
+                    href = "https://prestadores.pami.org.ar/" + href.lstrip("/")
+                if ".pdf" in href.lower() or "pliego" in href.lower() or "download" in href.lower():
+                    link_final = href
+                    break
+
+            if not link_final and todos_links_fila:
+                link_final = todos_links_fila[0]
+                if not link_final.startswith("http"):
+                    link_final = "https://prestadores.pami.org.ar/" + link_final.lstrip("/")
+
+            # Intentar descargar el PDF
+            if link_final:
+                try:
+                    r = requests.get(link_final, timeout=15, headers={
+                        "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
                     })
-                    print(f"  ✅ ENCONTRADO: {', '.join(productos)}")
-                time.sleep(0.5)
-            except Exception as e:
-                print(f"  Error {href}: {e}")
+                    if r.status_code == 200:
+                        content_type = r.headers.get("Content-Type", "")
+                        if "pdf" in content_type.lower():
+                            pdf_bytes = r.content
+                            print(f"  PDF descargado: {len(pdf_bytes)} bytes")
+                except Exception as e:
+                    print(f"  Error descargando PDF: {e}")
+
+            resultados.append({
+                "texto_fila": texto_fila[:300],
+                "productos":  productos,
+                "info":       info,
+                "link":       link_final,
+                "es_pdf":     pdf_bytes is not None,
+                "pdf_bytes":  pdf_bytes,
+                "buscador":   nombre,
+            })
 
     except Exception as e:
         print(f"  Error general: {e}")
 
-    return compras
-
-def extraer_info(texto):
-    info = {}
-    t = texto.upper() if texto else ""
-    m = re.search(r'COMPULSA[^\d]*(\d+)', t)
-    if m: info["numero"] = m.group(1)
-    m = re.search(r'UGL[:\s#]*(\d+\s*[-–]\s*[\w\s]{3,30})', t)
-    if m: info["ugl"] = m.group(1).strip()[:50]
-    m = re.search(r'(\d{2}/\d{2}/\d{4})\s*[-–]?\s*8:00', t)
-    if m: info["cierre"] = m.group(1)
-    if texto:
-        m = re.search(r'[\w.\-]+@pami\.org\.ar', texto.lower())
-        if m: info["email_contacto"] = m.group(0)
-    return info
+    return resultados
 
 def main():
     fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
@@ -210,10 +247,19 @@ def main():
     finally:
         driver.quit()
 
-    print(f"\n=== Total: {len(resultados)} resultado(s) ===")
+    # Deduplicar por número de compulsa
+    vistos = set()
+    resultados_unicos = []
+    for r in resultados:
+        key = r["info"].get("numero", r["texto_fila"][:50])
+        if key not in vistos:
+            vistos.add(key)
+            resultados_unicos.append(r)
 
-    if resultados:
-        enviar_email_con_coincidencias(resultados, adjuntos, fecha)
+    print(f"\n=== Total: {len(resultados_unicos)} resultado(s) ===")
+
+    if resultados_unicos:
+        enviar_email_con_coincidencias(resultados_unicos, adjuntos, fecha)
     else:
         enviar_email_sin_coincidencias(fecha)
 
@@ -246,10 +292,15 @@ def enviar_email_con_coincidencias(resultados, adjuntos, fecha):
         if info.get("ugl"):            lineas.append(f"<b>UGL:</b> {info['ugl']}")
         if info.get("cierre"):         lineas.append(f"<b>⚠️ Cierre:</b> {info['cierre']}")
         if info.get("email_contacto"): lineas.append(f"<b>Enviar cotización a:</b> {info['email_contacto']}")
+        if r.get("texto_fila"):        lineas.append(f"<b>Detalle:</b> {r['texto_fila'][:200]}")
         lineas.append(f"<b>Sección:</b> {r['buscador']}")
         info_html = "<br>".join(lineas)
-        btn = f'<a href="{r["link"]}" class="btn btn-blue">{"📄 Ver PDF" if r["es_pdf"] else "🔗 Ver compra"}</a>'
+        btn = ""
+        if r.get("link"):
+            label = "📄 Descargar PDF" if r["es_pdf"] else "🔗 Ver compra"
+            btn = f'<a href="{r["link"]}" class="btn btn-blue">{label}</a>'
         cards += f'<div class="card"><div style="margin-bottom:10px">{tags}</div><p class="info">{info_html}</p>{btn}</div>'
+
     adj_nota = f"<br><span style='font-size:13px;font-weight:normal'>📎 {len(adjuntos)} pliego(s) PDF adjunto(s)</span>" if adjuntos else ""
     html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">{ESTILO}</head><body>
     <div class="wrap">
