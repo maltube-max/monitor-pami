@@ -15,7 +15,6 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
-from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 
 EMAIL_ORIGEN  = "marialtube@gmail.com"
@@ -36,11 +35,26 @@ PALABRAS_CLAVE = {
     "Ken Valve":                   ["ken valve"],
 }
 
+# Textos que indican que es el formulario, no una fila de resultado
+IGNORAR_SI_CONTIENE = [
+    "seleccione", "tipo de compra", "fecha desde", "fecha hasta",
+    "aplicación de legislación", "compras menores", "concurso abreviado",
+    "licitación publica", "contratación directa", "descripción"
+]
+
 def normalizar(texto):
     texto = texto.lower()
     for a, b in [("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u"),("ü","u"),("ñ","n")]:
         texto = texto.replace(a, b)
     return texto
+
+def es_fila_formulario(texto):
+    """Devuelve True si el texto es del formulario y no de un resultado real."""
+    texto_norm = normalizar(texto)
+    for ignorar in IGNORAR_SI_CONTIENE:
+        if ignorar in texto_norm:
+            return True
+    return False
 
 def detectar_productos(texto):
     texto_norm = normalizar(texto)
@@ -62,7 +76,46 @@ def iniciar_browser():
     service = Service(ChromeDriverManager().install())
     return webdriver.Chrome(service=service, options=opciones)
 
-def obtener_compras(driver, nombre, url):
+def construir_link_pliego(nro_compulsa, ejercicio, expediente, par):
+    """
+    Construye el link al pliego PDF basado en los datos de la fila.
+    PAMI usa el expediente para identificar el pliego.
+    """
+    links_candidatos = []
+    
+    if expediente:
+        links_candidatos += [
+            f"https://prestadores.pami.org.ar/compras_ver_pliego.php?exp={expediente}&par={par}",
+            f"https://prestadores.pami.org.ar/compras_download.php?exp={expediente}",
+            f"https://prestadores.pami.org.ar/download_pliego.php?expediente={expediente}",
+        ]
+    if nro_compulsa and ejercicio:
+        links_candidatos += [
+            f"https://prestadores.pami.org.ar/compras_ver_pliego.php?nro={nro_compulsa}&ejercicio={ejercicio}&par={par}",
+            f"https://prestadores.pami.org.ar/compras_download.php?nro={nro_compulsa}&ejercicio={ejercicio}",
+        ]
+    
+    return links_candidatos
+
+def intentar_descargar(links):
+    """Intenta descargar un PDF de una lista de URLs candidatas."""
+    headers = {"User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"}
+    for url in links:
+        try:
+            r = requests.get(url, timeout=10, headers=headers)
+            if r.status_code == 200:
+                content_type = r.headers.get("Content-Type", "")
+                if "pdf" in content_type.lower():
+                    print(f"  ✅ PDF descargado de: {url}")
+                    return url, r.content
+                elif len(r.content) > 10000:  # archivo grande aunque no diga pdf
+                    print(f"  ✅ Archivo descargado de: {url}")
+                    return url, r.content
+        except:
+            pass
+    return "", None
+
+def obtener_compras(driver, nombre, url, par):
     print(f"\n--- {nombre} ---")
     resultados = []
 
@@ -76,7 +129,6 @@ def obtener_compras(driver, nombre, url):
             pass
         time.sleep(5)
 
-        # Seleccionar "En curso" y buscar
         try:
             select = Select(driver.find_element(By.NAME, "estado"))
             select.select_by_visible_text("En curso")
@@ -97,33 +149,6 @@ def obtener_compras(driver, nombre, url):
             pass
         time.sleep(5)
 
-        # Obtener el HTML completo de la página
-        html_pagina = driver.page_source
-        print(f"  HTML obtenido: {len(html_pagina)} chars")
-
-        # Buscar TODOS los links a pliegos en el HTML
-        # PAMI usa patrones como: ver_pliego.php, compras_ver, download, etc.
-        patrones_pliego = [
-            r'href=["\']([^"\']*(?:pliego|ver_pliego|download|adjunto|compras_ver)[^"\']*)["\']',
-            r'href=["\']([^"\']*compraselectronicas\.pami\.org\.ar[^"\']*\.pdf)["\']',
-            r'href=["\']([^"\']*\.pdf)["\']',
-            r'onclick=["\'][^"\']*window\.open\(["\']([^"\']+)["\']',
-        ]
-
-        todos_links_pliego = []
-        for patron in patrones_pliego:
-            matches = re.findall(patron, html_pagina, re.IGNORECASE)
-            for m in matches:
-                if m not in todos_links_pliego:
-                    if not m.startswith("http"):
-                        m = "https://prestadores.pami.org.ar/" + m.lstrip("/")
-                    todos_links_pliego.append(m)
-
-        print(f"  Links a pliegos: {len(todos_links_pliego)}")
-        for l in todos_links_pliego[:10]:
-            print(f"    {l}")
-
-        # Buscar filas de tabla que contengan palabras clave
         filas = driver.find_elements(By.TAG_NAME, "tr")
         print(f"  Total filas: {len(filas)}")
 
@@ -132,86 +157,60 @@ def obtener_compras(driver, nombre, url):
             if len(texto_fila) < 10:
                 continue
 
+            # IGNORAR filas del formulario
+            if es_fila_formulario(texto_fila):
+                continue
+
             productos = detectar_productos(texto_fila)
             if not productos:
                 continue
 
-            print(f"\n  ✅ FILA CON MATCH: {texto_fila[:300]}")
+            print(f"\n  ✅ MATCH REAL: {texto_fila[:200]}")
 
-            # Extraer info de la fila
-            info = {}
+            # Extraer datos de la fila
+            # Formato típico: "569/26 Compulsa Abreviada UGL V Bahía Blanca 2026 48212040 DESCRIPCION 28/05/2026"
+            nro_compulsa = ""
+            ejercicio = ""
+            expediente = ""
 
-            # Número de compulsa (ej: 569/26)
-            m = re.search(r'(\d+)/\d+', texto_fila)
-            if m: info["numero"] = m.group(1)
+            m = re.search(r'(\d+)/(\d+)', texto_fila)
+            if m:
+                nro_compulsa = m.group(1)
+                ejercicio = "20" + m.group(2) if len(m.group(2)) == 2 else m.group(2)
 
-            # UGL
-            m = re.search(r'UGL\s+(?:V|I+)?\s*([\w\s]+?)(?:\n|$)', texto_fila, re.IGNORECASE)
-            if m: info["ugl"] = m.group(1).strip()[:60]
+            m = re.search(r'(\d{8,})', texto_fila)
+            if m:
+                expediente = m.group(1)
 
-            # Fecha cierre
+            fecha_cierre = ""
             m = re.search(r'(\d{2}/\d{2}/\d{4})', texto_fila)
-            if m: info["cierre"] = m.group(1)
+            if m:
+                fecha_cierre = m.group(1)
 
-            # Email
-            m = re.search(r'[\w.\-]+@pami\.org\.ar', texto_fila.lower())
-            if m: info["email_contacto"] = m.group(0)
+            # Extraer UGL
+            ugl = ""
+            m = re.search(r'UGL\s+(?:V|I+|X+)?\s*([\w\s]+?)(?:\d{4}|\n|$)', texto_fila, re.IGNORECASE)
+            if m:
+                ugl = m.group(1).strip()[:60]
 
-            # Buscar links dentro de esta fila específica
-            links_fila = fila.find_elements(By.TAG_NAME, "a")
-            hrefs_fila = []
-            for a in links_fila:
-                href = a.get_attribute("href") or ""
-                onclick = a.get_attribute("onclick") or ""
-                if href and "result.php" not in href:
-                    hrefs_fila.append(href)
-                # Buscar en onclick
-                m_onclick = re.search(r"window\.open\(['\"]([^'\"]+)['\"]", onclick)
-                if m_onclick:
-                    hrefs_fila.append(m_onclick.group(1))
+            info = {
+                "numero":  nro_compulsa,
+                "ejercicio": ejercicio,
+                "expediente": expediente,
+                "ugl":     ugl,
+                "cierre":  fecha_cierre,
+            }
 
-            print(f"  Links en fila: {hrefs_fila}")
+            # Construir links candidatos al pliego
+            links_candidatos = construir_link_pliego(nro_compulsa, ejercicio, expediente, par)
+            print(f"  Links candidatos: {links_candidatos}")
 
-            # Buscar también en el HTML de la fila
-            html_fila = fila.get_attribute("innerHTML") or ""
-            links_html_fila = re.findall(r'href=["\']([^"\']+)["\']', html_fila)
-            onclick_links = re.findall(r"window\.open\(['\"]([^'\"]+)['\"]", html_fila)
-            todos_links_fila = hrefs_fila + onclick_links
-            for l in links_html_fila:
-                if l not in todos_links_fila and "result.php" not in l:
-                    todos_links_fila.append(l)
+            link_final, pdf_bytes = intentar_descargar(links_candidatos)
 
-            print(f"  Todos links fila: {todos_links_fila}")
-
-            # Elegir el mejor link
-            link_final = ""
-            pdf_bytes = None
-
-            for href in todos_links_fila:
-                if not href.startswith("http"):
-                    href = "https://prestadores.pami.org.ar/" + href.lstrip("/")
-                if ".pdf" in href.lower() or "pliego" in href.lower() or "download" in href.lower():
-                    link_final = href
-                    break
-
-            if not link_final and todos_links_fila:
-                link_final = todos_links_fila[0]
-                if not link_final.startswith("http"):
-                    link_final = "https://prestadores.pami.org.ar/" + link_final.lstrip("/")
-
-            # Intentar descargar el PDF
-            if link_final:
-                try:
-                    r = requests.get(link_final, timeout=15, headers={
-                        "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
-                    })
-                    if r.status_code == 200:
-                        content_type = r.headers.get("Content-Type", "")
-                        if "pdf" in content_type.lower():
-                            pdf_bytes = r.content
-                            print(f"  PDF descargado: {len(pdf_bytes)} bytes")
-                except Exception as e:
-                    print(f"  Error descargando PDF: {e}")
+            # Si no encontramos el PDF, al menos damos el link al buscador con el número
+            if not link_final:
+                link_final = url
+                print(f"  No se pudo descargar el PDF — usando link al buscador")
 
             resultados.append({
                 "texto_fila": texto_fila[:300],
@@ -237,8 +236,11 @@ def main():
     adjuntos = []
 
     try:
-        for nombre, url in URLS_BUSCADOR:
-            compras = obtener_compras(driver, nombre, url)
+        for nombre, url, par in [
+            ("UGL",           "https://prestadores.pami.org.ar/result.php?c=7-5&par=2", "2"),
+            ("Nivel Central", "https://prestadores.pami.org.ar/result.php?c=7-5&par=1", "1"),
+        ]:
+            compras = obtener_compras(driver, nombre, url, par)
             for c in compras:
                 if c["pdf_bytes"] and len(adjuntos) < 5:
                     n = f"pliego_{c['info'].get('numero', len(adjuntos)+1)}.pdf"
@@ -247,13 +249,15 @@ def main():
     finally:
         driver.quit()
 
-    # Deduplicar por número de compulsa
+    # Deduplicar
     vistos = set()
     resultados_unicos = []
     for r in resultados:
-        key = r["info"].get("numero", r["texto_fila"][:50])
-        if key not in vistos:
+        key = r["info"].get("numero","") + r["info"].get("expediente","")
+        if key and key not in vistos:
             vistos.add(key)
+            resultados_unicos.append(r)
+        elif not key:
             resultados_unicos.append(r)
 
     print(f"\n=== Total: {len(resultados_unicos)} resultado(s) ===")
@@ -288,17 +292,23 @@ def enviar_email_con_coincidencias(resultados, adjuntos, fecha):
         tags = "".join(f'<span class="tag">🔍 {p}</span>' for p in r["productos"])
         info = r.get("info", {})
         lineas = []
-        if info.get("numero"):         lineas.append(f"<b>Compulsa N°:</b> {info['numero']}")
-        if info.get("ugl"):            lineas.append(f"<b>UGL:</b> {info['ugl']}")
-        if info.get("cierre"):         lineas.append(f"<b>⚠️ Cierre:</b> {info['cierre']}")
-        if info.get("email_contacto"): lineas.append(f"<b>Enviar cotización a:</b> {info['email_contacto']}")
-        if r.get("texto_fila"):        lineas.append(f"<b>Detalle:</b> {r['texto_fila'][:200]}")
-        lineas.append(f"<b>Sección:</b> {r['buscador']}")
+        if info.get("numero"):     lineas.append(f"<b>Compulsa N°:</b> {info['numero']}/{info.get('ejercicio','')}")
+        if info.get("ugl"):        lineas.append(f"<b>UGL:</b> {info['ugl']}")
+        if info.get("cierre"):     lineas.append(f"<b>⚠️ Cierre:</b> {info['cierre']}")
+        if info.get("expediente"): lineas.append(f"<b>Expediente:</b> {info['expediente']}")
+        if r.get("texto_fila"):
+            # Mostrar solo la descripción, no todo el texto
+            desc = r['texto_fila']
+            # Buscar la parte de descripción
+            m = re.search(r'(VALVULA|CLIP|SENTINEL|BIOADAPT|KEN|LUX).*?(?=\d{2}/\d{2}/\d{4}|\Z)', desc, re.IGNORECASE)
+            if m:
+                lineas.append(f"<b>Descripción:</b> {m.group(0).strip()[:150]}")
         info_html = "<br>".join(lineas)
         btn = ""
-        if r.get("link"):
-            label = "📄 Descargar PDF" if r["es_pdf"] else "🔗 Ver compra"
-            btn = f'<a href="{r["link"]}" class="btn btn-blue">{label}</a>'
+        if r.get("link") and r.get("es_pdf"):
+            btn = f'<a href="{r["link"]}" class="btn btn-blue">📄 Descargar PDF</a>'
+        elif r.get("link"):
+            btn = f'<a href="{r["link"]}" class="btn btn-blue">🔗 Ver en PAMI</a>'
         cards += f'<div class="card"><div style="margin-bottom:10px">{tags}</div><p class="info">{info_html}</p>{btn}</div>'
 
     adj_nota = f"<br><span style='font-size:13px;font-weight:normal'>📎 {len(adjuntos)} pliego(s) PDF adjunto(s)</span>" if adjuntos else ""
