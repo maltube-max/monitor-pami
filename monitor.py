@@ -1,4 +1,3 @@
-import requests
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -9,6 +8,15 @@ import os
 import time
 import re
 import io
+import requests
+
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait, Select
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 
 # ── CONFIGURACIÓN ──────────────────────────────────────────
 EMAIL_ORIGEN  = "marialtube@gmail.com"
@@ -16,13 +24,11 @@ EMAIL_PASS    = os.environ.get("EMAIL_PASSWORD", "")
 EMAIL_DESTINO = "cotizaciones@siprotec.com.ar"
 URL_BASE      = "https://prestadores.pami.org.ar/"
 
-# Los dos buscadores
 URLS_BUSCADOR = [
-    "https://prestadores.pami.org.ar/result.php?c=7-5&par=2",  # UGL
-    "https://prestadores.pami.org.ar/result.php?c=7-5&par=1",  # Nivel Central
+    ("UGL",           "https://prestadores.pami.org.ar/result.php?c=7-5&par=2"),
+    ("Nivel Central", "https://prestadores.pami.org.ar/result.php?c=7-5&par=1"),
 ]
 
-# Palabras clave por producto
 PALABRAS_CLAVE = {
     "Clip Mitral":                 ["clip mitral", "mitraclip", "mitra clip"],
     "Lux Valve":                   ["lux valve", "lux value"],
@@ -32,12 +38,6 @@ PALABRAS_CLAVE = {
     "Ken Valve":                   ["ken valve"],
 }
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "es-AR,es;q=0.9",
-}
-
 # ── NORMALIZAR ─────────────────────────────────────────────
 def normalizar(texto):
     texto = texto.lower()
@@ -45,7 +45,6 @@ def normalizar(texto):
         texto = texto.replace(a, b)
     return texto
 
-# ── BUSCAR PALABRAS CLAVE EN TEXTO ─────────────────────────
 def detectar_productos(texto):
     texto_norm = normalizar(texto)
     encontrados = []
@@ -56,97 +55,128 @@ def detectar_productos(texto):
                 break
     return encontrados
 
-# ── OBTENER TODAS LAS COMPRAS EN CURSO ────────────────────
-def obtener_todas_compras(url_buscador):
-    """
-    Hace POST sin descripcion para traer TODAS las compras en curso,
-    luego extrae todos los links a documentos/PDFs.
-    """
-    session = requests.Session()
-    session.headers.update(HEADERS)
+# ── INICIAR BROWSER ────────────────────────────────────────
+def iniciar_browser():
+    opciones = Options()
+    opciones.add_argument("--headless")
+    opciones.add_argument("--no-sandbox")
+    opciones.add_argument("--disable-dev-shm-usage")
+    opciones.add_argument("--disable-gpu")
+    opciones.add_argument("--window-size=1920,1080")
+    opciones.add_argument("--lang=es-AR")
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=opciones)
+    return driver
+
+# ── OBTENER TODAS LAS COMPRAS CON SELENIUM ─────────────────
+def obtener_compras_selenium(driver, nombre, url):
+    print(f"\n--- {nombre}: {url} ---")
+    compras = []
 
     try:
-        # GET primero para obtener cookies
-        session.get(url_buscador, timeout=15)
-        time.sleep(1)
+        driver.get(url)
+        # Esperar que cargue la tabla o el formulario
+        time.sleep(5)
 
-        # POST sin descripcion = traer todo
-        payload = {
-            "descripcion": "",
-            "fecha_desde": "",
-            "fecha_hasta": "",
-            "tipo_compra": "",
-            "nro_compra":  "",
-            "estado":      "En curso",
-            "buscar":      "Buscar",
-        }
-        r = session.post(url_buscador, data=payload, timeout=30)
+        # Intentar seleccionar "En curso" en el select de estado
+        try:
+            select_estado = Select(driver.find_element(By.NAME, "estado"))
+            select_estado.select_by_visible_text("En curso")
+            time.sleep(1)
+        except:
+            pass
 
-        if r.status_code != 200:
-            print(f"  Error HTTP {r.status_code}")
-            return [], session
+        # Hacer clic en Buscar sin poner descripcion
+        try:
+            btn = driver.find_element(By.XPATH, "//input[@type='submit'] | //button[contains(text(),'Buscar')]")
+            btn.click()
+            time.sleep(5)
+        except:
+            pass
 
-        html = r.text
-        print(f"  HTML recibido: {len(html)} chars")
+        # Esperar que aparezca contenido
+        time.sleep(3)
 
-        # Extraer todos los links del HTML
-        links = re.findall(r'href=["\']([^"\']+)["\']', html, re.IGNORECASE)
-        compras = []
+        # Obtener todo el texto de la página
+        texto_pagina = driver.find_element(By.TAG_NAME, "body").text
+        print(f"  Texto obtenido: {len(texto_pagina)} chars")
+
+        # Buscar todos los links a documentos
+        links = driver.find_elements(By.TAG_NAME, "a")
+        links_docs = []
         for link in links:
-            if not link or link.startswith("javascript") or link == "#":
-                continue
-            if not link.startswith("http"):
-                link = URL_BASE + link.lstrip("/")
-            # Solo links que parezcan documentos de compras
-            if any(x in link.lower() for x in [
-                "pliego", "compra", "compulsa", "licitacion", "download",
-                "ver_archivo", "archivo", "adjunto", ".pdf", "doc"
-            ]):
-                if link not in [c["link"] for c in compras]:
-                    compras.append({"link": link, "es_pdf": ".pdf" in link.lower()})
+            href = link.get_attribute("href") or ""
+            texto_link = link.text.strip()
+            if any(x in href.lower() for x in ["pdf","pliego","compra","download","archivo","ver","adjunto"]):
+                if href and href not in links_docs:
+                    links_docs.append(href)
 
-        # También guardar el HTML completo como un item para buscar en él
-        compras.insert(0, {
-            "link": url_buscador,
-            "es_pdf": False,
-            "html_directo": html,
-        })
+        print(f"  Links encontrados: {len(links_docs)}")
 
-        print(f"  Links de documentos encontrados: {len(compras)-1}")
-        return compras, session
+        # Primero buscar en el texto completo de la pagina
+        productos_pagina = detectar_productos(texto_pagina)
+        if productos_pagina:
+            info = extraer_info(texto_pagina)
+            compras.append({
+                "link":     url,
+                "es_pdf":   False,
+                "productos": productos_pagina,
+                "info":     info,
+                "buscador": nombre,
+                "pdf_bytes": None,
+            })
+            print(f"  ✅ En página: {', '.join(productos_pagina)}")
 
-    except Exception as e:
-        print(f"  Error: {e}")
-        return [], session
-
-# ── LEER DOCUMENTO ─────────────────────────────────────────
-def leer_documento(link, session):
-    """Lee un documento (PDF o HTML) y retorna su texto y bytes."""
-    try:
-        r = session.get(link, timeout=20)
-        if r.status_code != 200:
-            return None, None
-
-        content_type = r.headers.get("Content-Type", "")
-
-        if "pdf" in content_type.lower() or link.lower().endswith(".pdf"):
+        # Luego revisar cada link
+        for href in links_docs:
             try:
-                from pdfminer.high_level import extract_text as pdf_extract
-                texto = pdf_extract(io.BytesIO(r.content))
-                return texto, r.content
-            except:
-                return r.content.decode("latin-1", errors="ignore"), r.content
+                print(f"  Revisando: {href}")
+                r = requests.get(href, timeout=15, headers={
+                    "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
+                })
+                if r.status_code != 200:
+                    continue
 
-        elif "html" in content_type.lower():
-            texto = re.sub(r'<[^>]+>', ' ', r.text)
-            texto = re.sub(r'\s+', ' ', texto).strip()
-            return texto, None
+                content_type = r.headers.get("Content-Type","")
+                texto_doc = ""
+                bytes_doc = None
+
+                if "pdf" in content_type.lower() or href.lower().endswith(".pdf"):
+                    try:
+                        from pdfminer.high_level import extract_text as pdf_extract
+                        texto_doc = pdf_extract(io.BytesIO(r.content))
+                        bytes_doc = r.content
+                    except:
+                        texto_doc = r.content.decode("latin-1", errors="ignore")
+                        bytes_doc = r.content
+                else:
+                    texto_doc = re.sub(r'<[^>]+>', ' ', r.text)
+                    texto_doc = re.sub(r'\s+', ' ', texto_doc).strip()
+
+                productos = detectar_productos(texto_doc)
+                if productos:
+                    info = extraer_info(texto_doc)
+                    compras.append({
+                        "link":     href,
+                        "es_pdf":   bytes_doc is not None,
+                        "productos": productos,
+                        "info":     info,
+                        "buscador": nombre,
+                        "pdf_bytes": bytes_doc,
+                    })
+                    print(f"  ✅ ENCONTRADO: {', '.join(productos)}")
+
+                time.sleep(0.5)
+
+            except Exception as e:
+                print(f"  Error en {href}: {e}")
 
     except Exception as e:
-        print(f"    Error leyendo {link}: {e}")
-    return None, None
+        print(f"  Error general: {e}")
 
-# ── EXTRAER INFO DEL DOCUMENTO ─────────────────────────────
+    return compras
+
+# ── EXTRAER INFO ───────────────────────────────────────────
 def extraer_info(texto):
     info = {}
     t = texto.upper() if texto else ""
@@ -166,51 +196,25 @@ def main():
     fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
     print(f"=== Monitor PAMI — {fecha} ===")
 
-    resultados = {}
+    driver = iniciar_browser()
+    resultados = []
     adjuntos = []
 
-    for url_buscador in URLS_BUSCADOR:
-        nombre = "UGL" if "par=2" in url_buscador else "Nivel Central"
-        print(f"\n--- {nombre} ---")
+    try:
+        for nombre, url in URLS_BUSCADOR:
+            compras = obtener_compras_selenium(driver, nombre, url)
+            for c in compras:
+                if c["pdf_bytes"] and len(adjuntos) < 5:
+                    n = f"pliego_{c['info'].get('numero', len(adjuntos)+1)}.pdf"
+                    adjuntos.append((n, c["pdf_bytes"]))
+                resultados.append(c)
+    finally:
+        driver.quit()
 
-        compras, session = obtener_todas_compras(url_buscador)
-
-        for compra in compras:
-            link = compra["link"]
-
-            # Si el HTML ya vino en la respuesta directa, usarlo
-            if compra.get("html_directo"):
-                texto = re.sub(r'<[^>]+>', ' ', compra["html_directo"])
-                texto = re.sub(r'\s+', ' ', texto).strip()
-                bytes_doc = None
-            else:
-                print(f"  Revisando: {link}")
-                texto, bytes_doc = leer_documento(link, session)
-                time.sleep(0.5)
-
-            if not texto:
-                continue
-
-            productos = detectar_productos(texto)
-            if productos:
-                if link not in resultados:
-                    info = extraer_info(texto)
-                    resultados[link] = {
-                        "link":     link,
-                        "es_pdf":   compra["es_pdf"],
-                        "productos": productos,
-                        "info":     info,
-                        "buscador": nombre,
-                    }
-                    print(f"  ✅ ENCONTRADO: {', '.join(productos)} — {link}")
-                    if bytes_doc and len(adjuntos) < 5:
-                        nombre_pdf = f"pliego_{info.get('numero', len(adjuntos)+1)}.pdf"
-                        adjuntos.append((nombre_pdf, bytes_doc))
-
-    print(f"\n=== Total: {len(resultados)} compra(s) encontrada(s) ===")
+    print(f"\n=== Total: {len(resultados)} resultado(s) ===")
 
     if resultados:
-        enviar_email_con_coincidencias(list(resultados.values()), adjuntos, fecha)
+        enviar_email_con_coincidencias(resultados, adjuntos, fecha)
     else:
         enviar_email_sin_coincidencias(fecha)
 
@@ -218,24 +222,20 @@ def main():
 ESTILO = """<style>
 body{font-family:'Helvetica Neue',Arial,sans-serif;background:#f4f6f9;margin:0;padding:0}
 .wrap{max-width:640px;margin:30px auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.1)}
-.header{background:#1a5276;padding:22px 30px}
-.header h1{margin:0;color:#fff;font-size:20px}
+.header{background:#1a5276;padding:22px 30px}.header h1{margin:0;color:#fff;font-size:20px}
 .header p{margin:5px 0 0;color:#aed6f1;font-size:13px}
 .banner-ok{background:#eafaf1;border-left:4px solid #27ae60;padding:14px 24px}
 .banner-ok p{margin:0;color:#1e8449;font-size:15px;font-weight:600}
 .banner-no{background:#fdfefe;border-left:4px solid #85929e;padding:14px 24px}
 .banner-no p{margin:0;color:#5d6d7e;font-size:15px;font-weight:600}
-.body{padding:24px 30px}
-.card{background:#f8fafb;border:1px solid #d5e8d4;border-left:5px solid #27ae60;border-radius:6px;padding:16px 20px;margin-bottom:16px}
+.body{padding:24px 30px}.card{background:#f8fafb;border:1px solid #d5e8d4;border-left:5px solid #27ae60;border-radius:6px;padding:16px 20px;margin-bottom:16px}
 .tag{display:inline-block;background:#eafaf1;color:#1e8449;padding:2px 10px;border-radius:4px;font-size:13px;margin:2px;font-weight:600}
 .btn{display:inline-block;padding:10px 22px;border-radius:6px;text-decoration:none;font-size:14px;font-weight:600;margin-top:10px;margin-right:8px}
-.btn-blue{background:#1a5276;color:#fff!important}
-.btn-gray{background:#85929e;color:#fff!important}
+.btn-blue{background:#1a5276;color:#fff!important}.btn-gray{background:#85929e;color:#fff!important}
 .info{font-size:13px;color:#555;margin:8px 0;line-height:1.8}
 .footer{background:#f4f6f9;padding:14px 30px;border-top:1px solid #e8ecf0;text-align:center}
 .footer p{margin:0;font-size:11px;color:#aaa}
-ul{padding-left:20px}
-ul li{margin:4px 0;color:#555;font-size:14px}
+ul{padding-left:20px}ul li{margin:4px 0;color:#555;font-size:14px}
 </style>"""
 
 def enviar_email_con_coincidencias(resultados, adjuntos, fecha):
@@ -251,24 +251,18 @@ def enviar_email_con_coincidencias(resultados, adjuntos, fecha):
         lineas.append(f"<b>Sección:</b> {r['buscador']}")
         info_html = "<br>".join(lineas)
         btn = f'<a href="{r["link"]}" class="btn btn-blue">{"📄 Ver PDF" if r["es_pdf"] else "🔗 Ver compra"}</a>'
-        cards += f"""<div class="card">
-          <div style="margin-bottom:10px">{tags}</div>
-          <p class="info">{info_html}</p>
-          {btn}</div>"""
+        cards += f'<div class="card"><div style="margin-bottom:10px">{tags}</div><p class="info">{info_html}</p>{btn}</div>'
 
     adj_nota = f"<br><span style='font-size:13px;font-weight:normal'>📎 {len(adjuntos)} pliego(s) PDF adjunto(s)</span>" if adjuntos else ""
     html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">{ESTILO}</head><body>
     <div class="wrap">
       <div class="header"><h1>🏥 Monitor PAMI — Siprotec</h1><p>{fecha} | Revisión automática diaria</p></div>
       <div class="banner-ok"><p>✅ <strong>{len(resultados)}</strong> compra(s) encontrada(s) con productos Siprotec.{adj_nota}</p></div>
-      <div class="body">
-        <h2 style="color:#1a5276;font-size:15px;margin:0 0 16px">Compras detectadas:</h2>
-        {cards}
+      <div class="body"><h2 style="color:#1a5276;font-size:15px;margin:0 0 16px">Compras detectadas:</h2>{cards}
         <div style="margin-top:20px;text-align:center">
           <a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=2" class="btn btn-gray">🔎 PAMI UGL</a>
           <a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=1" class="btn btn-gray">🔎 PAMI Central</a>
-        </div>
-      </div>
+        </div></div>
       <div class="footer"><p>Monitor automático PAMI · Siprotec S.A. · Revisión diaria 7 AM (ARG)</p></div>
     </div></body></html>"""
     _enviar(f"✅ PAMI | {len(resultados)} pedido(s) encontrado(s) — {fecha}", html, adjuntos)
@@ -279,14 +273,11 @@ def enviar_email_sin_coincidencias(fecha):
     <div class="wrap">
       <div class="header"><h1>🏥 Monitor PAMI — Siprotec</h1><p>{fecha} | Revisión automática diaria</p></div>
       <div class="banner-no"><p>ℹ️ No se encontraron pedidos relevantes hoy en UGL ni Nivel Central.</p></div>
-      <div class="body">
-        <p style="color:#555;font-size:14px">Productos monitoreados:</p>
-        <ul>{items}</ul>
+      <div class="body"><p style="color:#555;font-size:14px">Productos monitoreados:</p><ul>{items}</ul>
         <div style="margin-top:20px;text-align:center">
           <a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=2" class="btn btn-gray">🔗 PAMI UGL</a>
           <a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=1" class="btn btn-gray">🔗 PAMI Central</a>
-        </div>
-      </div>
+        </div></div>
       <div class="footer"><p>Monitor automático PAMI · Siprotec S.A. · Revisión diaria 7 AM (ARG)</p></div>
     </div></body></html>"""
     _enviar(f"ℹ️ PAMI | Sin pedidos relevantes — {fecha}", html)
