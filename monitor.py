@@ -8,22 +8,22 @@ from datetime import datetime
 import os
 import time
 import re
+import io
 
 # ── CONFIGURACIÓN ──────────────────────────────────────────
 EMAIL_ORIGEN  = "marialtube@gmail.com"
 EMAIL_PASS    = os.environ.get("EMAIL_PASSWORD", "")
 EMAIL_DESTINO = "cotizaciones@siprotec.com.ar"
+URL_BASE      = "https://prestadores.pami.org.ar/"
 
-URL_BASE = "https://prestadores.pami.org.ar/"
-
-# Los dos buscadores: UGL y Nivel Central
+# Los dos buscadores
 URLS_BUSCADOR = [
     "https://prestadores.pami.org.ar/result.php?c=7-5&par=2",  # UGL
     "https://prestadores.pami.org.ar/result.php?c=7-5&par=1",  # Nivel Central
 ]
 
-# Palabras clave por producto — se busca cada variante por separado en el formulario
-BUSQUEDAS = {
+# Palabras clave por producto
+PALABRAS_CLAVE = {
     "Clip Mitral":                 ["clip mitral", "mitraclip", "mitra clip"],
     "Lux Valve":                   ["lux valve", "lux value"],
     "Válvula Tricuspídea":         ["tricuspide", "tricuspidea", "valvula tricuspide"],
@@ -45,16 +45,34 @@ def normalizar(texto):
         texto = texto.replace(a, b)
     return texto
 
-# ── BUSCAR EN FORMULARIO ───────────────────────────────────
-def buscar_en_formulario(url_buscador, descripcion):
-    """Envía el formulario con una descripción y retorna el HTML del resultado."""
-    try:
-        session = requests.Session()
-        session.headers.update(HEADERS)
-        session.get(url_buscador, timeout=15)  # obtener cookies
+# ── BUSCAR PALABRAS CLAVE EN TEXTO ─────────────────────────
+def detectar_productos(texto):
+    texto_norm = normalizar(texto)
+    encontrados = []
+    for producto, variantes in PALABRAS_CLAVE.items():
+        for v in variantes:
+            if normalizar(v) in texto_norm:
+                encontrados.append(producto)
+                break
+    return encontrados
 
+# ── OBTENER TODAS LAS COMPRAS EN CURSO ────────────────────
+def obtener_todas_compras(url_buscador):
+    """
+    Hace POST sin descripcion para traer TODAS las compras en curso,
+    luego extrae todos los links a documentos/PDFs.
+    """
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    try:
+        # GET primero para obtener cookies
+        session.get(url_buscador, timeout=15)
+        time.sleep(1)
+
+        # POST sin descripcion = traer todo
         payload = {
-            "descripcion": descripcion,
+            "descripcion": "",
             "fecha_desde": "",
             "fecha_hasta": "",
             "tipo_compra": "",
@@ -62,90 +80,85 @@ def buscar_en_formulario(url_buscador, descripcion):
             "estado":      "En curso",
             "buscar":      "Buscar",
         }
-        r = session.post(url_buscador, data=payload, timeout=20)
-        if r.status_code == 200:
-            return r.text
+        r = session.post(url_buscador, data=payload, timeout=30)
+
+        if r.status_code != 200:
+            print(f"  Error HTTP {r.status_code}")
+            return [], session
+
+        html = r.text
+        print(f"  HTML recibido: {len(html)} chars")
+
+        # Extraer todos los links del HTML
+        links = re.findall(r'href=["\']([^"\']+)["\']', html, re.IGNORECASE)
+        compras = []
+        for link in links:
+            if not link or link.startswith("javascript") or link == "#":
+                continue
+            if not link.startswith("http"):
+                link = URL_BASE + link.lstrip("/")
+            # Solo links que parezcan documentos de compras
+            if any(x in link.lower() for x in [
+                "pliego", "compra", "compulsa", "licitacion", "download",
+                "ver_archivo", "archivo", "adjunto", ".pdf", "doc"
+            ]):
+                if link not in [c["link"] for c in compras]:
+                    compras.append({"link": link, "es_pdf": ".pdf" in link.lower()})
+
+        # También guardar el HTML completo como un item para buscar en él
+        compras.insert(0, {
+            "link": url_buscador,
+            "es_pdf": False,
+            "html_directo": html,
+        })
+
+        print(f"  Links de documentos encontrados: {len(compras)-1}")
+        return compras, session
+
     except Exception as e:
-        print(f"  Error buscando '{descripcion}': {e}")
-    return None
+        print(f"  Error: {e}")
+        return [], session
 
-# ── PARSEAR RESULTADOS ─────────────────────────────────────
-def parsear_resultados(html, url_buscador):
-    """Extrae filas de resultados del HTML y retorna lista de compras."""
-    if not html or "Cargando" in html:
-        return []
-
-    compras = []
-    
-    # Buscar filas de tabla con resultados
-    filas = re.findall(r'<tr[^>]*>(.*?)</tr>', html, re.DOTALL | re.IGNORECASE)
-    
-    for fila in filas:
-        texto = re.sub(r'<[^>]+>', ' ', fila)
-        texto = re.sub(r'\s+', ' ', texto).strip()
-        
-        if len(texto) < 30:
-            continue
-        
-        # Saltar filas de encabezado
-        if normalizar(texto).startswith("descripcion") or normalizar(texto).startswith("n°"):
-            continue
-
-        # Buscar links a PDFs o documentos
-        links = re.findall(r'href=["\']([^"\']+)["\']', fila, re.IGNORECASE)
-        link_doc = ""
-        link_pdf = ""
-        for l in links:
-            if not l.startswith("http"):
-                l = URL_BASE + l.lstrip("/")
-            if ".pdf" in l.lower():
-                link_pdf = l
-            elif any(x in l.lower() for x in ["pliego","compra","download","ver","detalle"]):
-                link_doc = l
-
-        if texto:
-            compras.append({
-                "texto":     normalizar(texto),
-                "titulo":    texto[:300],
-                "link":      link_pdf or link_doc or url_buscador,
-                "link_pdf":  link_pdf,
-                "es_pdf":    bool(link_pdf),
-            })
-
-    return compras
-
-# ── DESCARGAR Y LEER PDF ───────────────────────────────────
-def leer_pdf(url):
-    """Descarga un PDF y extrae su texto. Retorna (texto, bytes)."""
+# ── LEER DOCUMENTO ─────────────────────────────────────────
+def leer_documento(link, session):
+    """Lee un documento (PDF o HTML) y retorna su texto y bytes."""
     try:
-        r = requests.get(url, headers=HEADERS, timeout=20)
+        r = session.get(link, timeout=20)
         if r.status_code != 200:
             return None, None
-        content_type = r.headers.get("Content-Type","")
-        if "pdf" in content_type.lower() or url.lower().endswith(".pdf"):
+
+        content_type = r.headers.get("Content-Type", "")
+
+        if "pdf" in content_type.lower() or link.lower().endswith(".pdf"):
             try:
-                import io
-                from pdfminer.high_level import extract_text
-                texto = extract_text(io.BytesIO(r.content))
+                from pdfminer.high_level import extract_text as pdf_extract
+                texto = pdf_extract(io.BytesIO(r.content))
                 return texto, r.content
             except:
                 return r.content.decode("latin-1", errors="ignore"), r.content
+
+        elif "html" in content_type.lower():
+            texto = re.sub(r'<[^>]+>', ' ', r.text)
+            texto = re.sub(r'\s+', ' ', texto).strip()
+            return texto, None
+
     except Exception as e:
-        print(f"  Error leyendo PDF {url}: {e}")
+        print(f"    Error leyendo {link}: {e}")
     return None, None
 
-# ── EXTRAER INFO ───────────────────────────────────────────
+# ── EXTRAER INFO DEL DOCUMENTO ─────────────────────────────
 def extraer_info(texto):
     info = {}
-    t = texto.upper()
+    t = texto.upper() if texto else ""
     m = re.search(r'COMPULSA[^\d]*(\d+)', t)
     if m: info["numero"] = m.group(1)
-    m = re.search(r'UGL[:\s#]+(\d+\s*[-–]\s*[\w\s]+)', t)
+    m = re.search(r'UGL[:\s#]*(\d+\s*[-–]\s*[\w\s]{3,30})', t)
     if m: info["ugl"] = m.group(1).strip()[:50]
-    m = re.search(r'(\d{2}/\d{2}/\d{4})\s*[-–]\s*8:00', t)
+    m = re.search(r'(\d{2}/\d{2}/\d{4})\s*[-–]?\s*8:00', t)
     if m: info["cierre"] = m.group(1)
-    m = re.search(r'[\w\.\-]+@pami\.org\.ar', texto.lower())
-    if m: info["email_contacto"] = m.group(0)
+    if texto:
+        m = re.search(r'[\w.\-]+@pami\.org\.ar', texto.lower())
+        if m: info["email_contacto"] = m.group(0)
     return info
 
 # ── MAIN ───────────────────────────────────────────────────
@@ -153,148 +166,125 @@ def main():
     fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
     print(f"=== Monitor PAMI — {fecha} ===")
 
-    resultados = {}  # link -> dict con info del resultado
+    resultados = {}
+    adjuntos = []
 
     for url_buscador in URLS_BUSCADOR:
-        nombre_buscador = "UGL" if "par=2" in url_buscador else "Nivel Central"
-        print(f"\n--- Buscando en {nombre_buscador} ---")
+        nombre = "UGL" if "par=2" in url_buscador else "Nivel Central"
+        print(f"\n--- {nombre} ---")
 
-        for producto, variantes in BUSQUEDAS.items():
-            for variante in variantes:
-                print(f"  Buscando: '{variante}'")
-                html = buscar_en_formulario(url_buscador, variante)
-                compras = parsear_resultados(html, url_buscador)
+        compras, session = obtener_todas_compras(url_buscador)
 
-                for compra in compras:
-                    link = compra["link"]
-                    if link not in resultados:
-                        resultados[link] = {
-                            **compra,
-                            "productos":  set(),
-                            "buscador":   nombre_buscador,
-                            "pdf_bytes":  None,
-                            "info":       {},
-                        }
-                    resultados[link]["productos"].add(producto)
+        for compra in compras:
+            link = compra["link"]
 
-                time.sleep(1.5)
+            # Si el HTML ya vino en la respuesta directa, usarlo
+            if compra.get("html_directo"):
+                texto = re.sub(r'<[^>]+>', ' ', compra["html_directo"])
+                texto = re.sub(r'\s+', ' ', texto).strip()
+                bytes_doc = None
+            else:
+                print(f"  Revisando: {link}")
+                texto, bytes_doc = leer_documento(link, session)
+                time.sleep(0.5)
 
-    print(f"\nTotal coincidencias únicas: {len(resultados)}")
+            if not texto:
+                continue
 
-    # Intentar descargar PDFs y extraer info
-    adjuntos = []
-    for link, datos in resultados.items():
-        if datos["es_pdf"]:
-            print(f"Descargando PDF: {link}")
-            texto_pdf, bytes_pdf = leer_pdf(link)
-            if bytes_pdf:
-                datos["pdf_bytes"] = bytes_pdf
-                datos["info"] = extraer_info(texto_pdf or "")
-                adjuntos.append((
-                    f"pliego_{datos['info'].get('numero', len(adjuntos)+1)}.pdf",
-                    bytes_pdf
-                ))
+            productos = detectar_productos(texto)
+            if productos:
+                if link not in resultados:
+                    info = extraer_info(texto)
+                    resultados[link] = {
+                        "link":     link,
+                        "es_pdf":   compra["es_pdf"],
+                        "productos": productos,
+                        "info":     info,
+                        "buscador": nombre,
+                    }
+                    print(f"  ✅ ENCONTRADO: {', '.join(productos)} — {link}")
+                    if bytes_doc and len(adjuntos) < 5:
+                        nombre_pdf = f"pliego_{info.get('numero', len(adjuntos)+1)}.pdf"
+                        adjuntos.append((nombre_pdf, bytes_doc))
 
-    # Convertir sets a listas
-    for datos in resultados.values():
-        datos["productos"] = list(datos["productos"])
+    print(f"\n=== Total: {len(resultados)} compra(s) encontrada(s) ===")
 
     if resultados:
         enviar_email_con_coincidencias(list(resultados.values()), adjuntos, fecha)
     else:
         enviar_email_sin_coincidencias(fecha)
 
-# ── TEMPLATES EMAIL ────────────────────────────────────────
-ESTILO = """
-<style>
-  body{font-family:'Helvetica Neue',Arial,sans-serif;background:#f4f6f9;margin:0;padding:0}
-  .wrap{max-width:640px;margin:30px auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.1)}
-  .header{background:#1a5276;padding:22px 30px}
-  .header h1{margin:0;color:#fff;font-size:20px}
-  .header p{margin:5px 0 0;color:#aed6f1;font-size:13px}
-  .banner-ok{background:#eafaf1;border-left:4px solid #27ae60;padding:14px 24px}
-  .banner-ok p{margin:0;color:#1e8449;font-size:15px;font-weight:600}
-  .banner-no{background:#fdfefe;border-left:4px solid #85929e;padding:14px 24px}
-  .banner-no p{margin:0;color:#5d6d7e;font-size:15px;font-weight:600}
-  .body{padding:24px 30px}
-  .card{background:#f8fafb;border:1px solid #d5e8d4;border-left:5px solid #27ae60;border-radius:6px;padding:16px 20px;margin-bottom:16px}
-  .tag{display:inline-block;background:#eafaf1;color:#1e8449;padding:2px 10px;border-radius:4px;font-size:13px;margin:2px;font-weight:600}
-  .btn{display:inline-block;padding:10px 22px;border-radius:6px;text-decoration:none;font-size:14px;font-weight:600;margin-top:10px;margin-right:8px}
-  .btn-blue{background:#1a5276;color:#fff!important}
-  .btn-gray{background:#85929e;color:#fff!important}
-  .info{font-size:13px;color:#555;margin:8px 0;line-height:1.6}
-  .footer{background:#f4f6f9;padding:14px 30px;border-top:1px solid #e8ecf0;text-align:center}
-  .footer p{margin:0;font-size:11px;color:#aaa}
-  ul{padding-left:20px}
-  ul li{margin:4px 0;color:#555;font-size:14px}
-</style>
-"""
+# ── EMAILS ─────────────────────────────────────────────────
+ESTILO = """<style>
+body{font-family:'Helvetica Neue',Arial,sans-serif;background:#f4f6f9;margin:0;padding:0}
+.wrap{max-width:640px;margin:30px auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.1)}
+.header{background:#1a5276;padding:22px 30px}
+.header h1{margin:0;color:#fff;font-size:20px}
+.header p{margin:5px 0 0;color:#aed6f1;font-size:13px}
+.banner-ok{background:#eafaf1;border-left:4px solid #27ae60;padding:14px 24px}
+.banner-ok p{margin:0;color:#1e8449;font-size:15px;font-weight:600}
+.banner-no{background:#fdfefe;border-left:4px solid #85929e;padding:14px 24px}
+.banner-no p{margin:0;color:#5d6d7e;font-size:15px;font-weight:600}
+.body{padding:24px 30px}
+.card{background:#f8fafb;border:1px solid #d5e8d4;border-left:5px solid #27ae60;border-radius:6px;padding:16px 20px;margin-bottom:16px}
+.tag{display:inline-block;background:#eafaf1;color:#1e8449;padding:2px 10px;border-radius:4px;font-size:13px;margin:2px;font-weight:600}
+.btn{display:inline-block;padding:10px 22px;border-radius:6px;text-decoration:none;font-size:14px;font-weight:600;margin-top:10px;margin-right:8px}
+.btn-blue{background:#1a5276;color:#fff!important}
+.btn-gray{background:#85929e;color:#fff!important}
+.info{font-size:13px;color:#555;margin:8px 0;line-height:1.8}
+.footer{background:#f4f6f9;padding:14px 30px;border-top:1px solid #e8ecf0;text-align:center}
+.footer p{margin:0;font-size:11px;color:#aaa}
+ul{padding-left:20px}
+ul li{margin:4px 0;color:#555;font-size:14px}
+</style>"""
 
 def enviar_email_con_coincidencias(resultados, adjuntos, fecha):
     cards = ""
     for r in resultados:
         tags = "".join(f'<span class="tag">🔍 {p}</span>' for p in r["productos"])
         info = r.get("info", {})
-        info_items = []
-        if info.get("numero"):        info_items.append(f"<b>Compulsa N°:</b> {info['numero']}")
-        if info.get("ugl"):           info_items.append(f"<b>UGL:</b> {info['ugl']}")
-        if info.get("cierre"):        info_items.append(f"<b>⚠️ Cierre:</b> {info['cierre']}")
-        if info.get("email_contacto"):info_items.append(f"<b>Enviar cotización a:</b> {info['email_contacto']}")
-        if r.get("buscador"):         info_items.append(f"<b>Sección:</b> {r['buscador']}")
-        info_str = "<br>".join(info_items)
-
+        lineas = []
+        if info.get("numero"):         lineas.append(f"<b>Compulsa N°:</b> {info['numero']}")
+        if info.get("ugl"):            lineas.append(f"<b>UGL:</b> {info['ugl']}")
+        if info.get("cierre"):         lineas.append(f"<b>⚠️ Cierre:</b> {info['cierre']}")
+        if info.get("email_contacto"): lineas.append(f"<b>Enviar cotización a:</b> {info['email_contacto']}")
+        lineas.append(f"<b>Sección:</b> {r['buscador']}")
+        info_html = "<br>".join(lineas)
         btn = f'<a href="{r["link"]}" class="btn btn-blue">{"📄 Ver PDF" if r["es_pdf"] else "🔗 Ver compra"}</a>'
-
-        cards += f"""
-        <div class="card">
+        cards += f"""<div class="card">
           <div style="margin-bottom:10px">{tags}</div>
-          <p class="info">{info_str}</p>
-          <p style="font-size:12px;color:#888;margin:6px 0">{r['titulo'][:250]}</p>
-          {btn}
-        </div>"""
+          <p class="info">{info_html}</p>
+          {btn}</div>"""
 
-    adj_nota = f"<br><span style='font-size:13px;font-weight:normal'>📎 Se adjuntan {len(adjuntos)} pliego(s) PDF</span>" if adjuntos else ""
-
+    adj_nota = f"<br><span style='font-size:13px;font-weight:normal'>📎 {len(adjuntos)} pliego(s) PDF adjunto(s)</span>" if adjuntos else ""
     html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">{ESTILO}</head><body>
     <div class="wrap">
-      <div class="header">
-        <h1>🏥 Monitor PAMI — Siprotec</h1>
-        <p>{fecha} | Revisión automática diaria</p>
-      </div>
-      <div class="banner-ok">
-        <p>✅ Se encontraron <strong>{len(resultados)}</strong> compra(s) con productos Siprotec.{adj_nota}</p>
-      </div>
+      <div class="header"><h1>🏥 Monitor PAMI — Siprotec</h1><p>{fecha} | Revisión automática diaria</p></div>
+      <div class="banner-ok"><p>✅ <strong>{len(resultados)}</strong> compra(s) encontrada(s) con productos Siprotec.{adj_nota}</p></div>
       <div class="body">
         <h2 style="color:#1a5276;font-size:15px;margin:0 0 16px">Compras detectadas:</h2>
         {cards}
         <div style="margin-top:20px;text-align:center">
-          <a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=2" class="btn btn-gray">🔎 Ver portal PAMI UGL</a>
-          <a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=1" class="btn btn-gray">🔎 Ver portal PAMI Central</a>
+          <a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=2" class="btn btn-gray">🔎 PAMI UGL</a>
+          <a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=1" class="btn btn-gray">🔎 PAMI Central</a>
         </div>
       </div>
       <div class="footer"><p>Monitor automático PAMI · Siprotec S.A. · Revisión diaria 7 AM (ARG)</p></div>
     </div></body></html>"""
-
     _enviar(f"✅ PAMI | {len(resultados)} pedido(s) encontrado(s) — {fecha}", html, adjuntos)
 
 def enviar_email_sin_coincidencias(fecha):
-    productos = list(BUSQUEDAS.keys())
-    items = "".join(f"<li>{p}</li>" for p in productos)
+    items = "".join(f"<li>{p}</li>" for p in PALABRAS_CLAVE.keys())
     html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">{ESTILO}</head><body>
     <div class="wrap">
-      <div class="header">
-        <h1>🏥 Monitor PAMI — Siprotec</h1>
-        <p>{fecha} | Revisión automática diaria</p>
-      </div>
-      <div class="banner-no">
-        <p>ℹ️ No se encontraron pedidos relevantes hoy en UGL ni Nivel Central.</p>
-      </div>
+      <div class="header"><h1>🏥 Monitor PAMI — Siprotec</h1><p>{fecha} | Revisión automática diaria</p></div>
+      <div class="banner-no"><p>ℹ️ No se encontraron pedidos relevantes hoy en UGL ni Nivel Central.</p></div>
       <div class="body">
-        <p style="color:#555;font-size:14px">Productos monitoreados sin resultados:</p>
+        <p style="color:#555;font-size:14px">Productos monitoreados:</p>
         <ul>{items}</ul>
         <div style="margin-top:20px;text-align:center">
-          <a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=2" class="btn btn-gray">🔗 Ver portal PAMI UGL</a>
-          <a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=1" class="btn btn-gray">🔗 Ver portal PAMI Central</a>
+          <a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=2" class="btn btn-gray">🔗 PAMI UGL</a>
+          <a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=1" class="btn btn-gray">🔗 PAMI Central</a>
         </div>
       </div>
       <div class="footer"><p>Monitor automático PAMI · Siprotec S.A. · Revisión diaria 7 AM (ARG)</p></div>
