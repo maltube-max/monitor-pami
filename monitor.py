@@ -1,5 +1,4 @@
 import requests
-from bs4 import BeautifulSoup
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -7,24 +6,58 @@ from email.mime.base import MIMEBase
 from email import encoders
 from datetime import datetime
 import os
+import time
 import re
 
 # ── CONFIGURACIÓN ──────────────────────────────────────────
-URL_PORTAL = "https://prestadores.pami.org.ar/result.php?c=7-5&par=2"
-URL_BASE   = "https://prestadores.pami.org.ar/"
-
 EMAIL_ORIGEN  = "marialtube@gmail.com"
 EMAIL_PASS    = os.environ.get("EMAIL_PASSWORD", "")
 EMAIL_DESTINO = "cotizaciones@siprotec.com.ar"
 
-PALABRAS_CLAVE = {
-    "Clip Mitral":                ["clip mitral", "clip-mitral", "clipmitral", "mitraclip", "mitra clip"],
-    "Lux Valve":                  ["lux valve", "lux-valve", "luxvalve", "lux value"],
-    "Válvula Tricuspídea":        ["valvula tricuspidea", "valvula tricuspide", "tricuspidea",
-                                   "tricuspide", "tricuspid", "valvula tricuspídea", "válvula tricúspide"],
-    "Protector Cerebral Sentinel":["sentinel", "protector cerebral", "filtro cerebral"],
-    "Bioadaptador":               ["bioadaptador", "bio adaptador", "bio-adaptador"],
-    "Ken Valve":                  ["ken valve", "ken-valve", "kenvalve"],
+# Todas las variantes de búsqueda — juntas, separadas, con y sin mayúsculas
+# Google busca sin importar mayúsculas, así que alcanza con una variante por producto
+BUSQUEDAS = [
+    # Clip Mitral
+    'site:prestadores.pami.org.ar "clip mitral"',
+    'site:prestadores.pami.org.ar "mitraclip"',
+    'site:prestadores.pami.org.ar "mitra clip"',
+
+    # Lux Valve
+    'site:prestadores.pami.org.ar "lux valve"',
+    'site:prestadores.pami.org.ar "lux value"',
+
+    # Válvula Tricuspídea
+    'site:prestadores.pami.org.ar "valvula tricuspide"',
+    'site:prestadores.pami.org.ar "tricuspidea"',
+    'site:prestadores.pami.org.ar "tricuspide percutanea"',
+
+    # Protector Cerebral Sentinel
+    'site:prestadores.pami.org.ar "sentinel"',
+    'site:prestadores.pami.org.ar "protector cerebral"',
+
+    # Bioadaptador
+    'site:prestadores.pami.org.ar "bioadaptador"',
+    'site:prestadores.pami.org.ar "bio adaptador"',
+
+    # Ken Valve
+    'site:prestadores.pami.org.ar "ken valve"',
+]
+
+# Mapeo de palabras clave a nombre de producto
+PRODUCTO_MAP = {
+    "clip mitral":           "Clip Mitral",
+    "mitraclip":             "Clip Mitral",
+    "mitra clip":            "Clip Mitral",
+    "lux valve":             "Lux Valve",
+    "lux value":             "Lux Valve",
+    "valvula tricuspide":    "Válvula Tricuspídea",
+    "tricuspidea":           "Válvula Tricuspídea",
+    "tricuspide percutanea": "Válvula Tricuspídea",
+    "sentinel":              "Protector Cerebral Sentinel",
+    "protector cerebral":    "Protector Cerebral Sentinel",
+    "bioadaptador":          "Bioadaptador",
+    "bio adaptador":         "Bioadaptador",
+    "ken valve":             "Ken Valve",
 }
 
 # ── NORMALIZAR TEXTO ───────────────────────────────────────
@@ -34,146 +67,304 @@ def normalizar(texto):
         texto = texto.replace(a, b)
     return texto
 
-# ── OBTENER DATOS DE PAMI ──────────────────────────────────
-def obtener_compras():
+# ── BUSCAR EN GOOGLE ───────────────────────────────────────
+def buscar_en_google(query):
+    """Hace una búsqueda en Google y retorna los links encontrados."""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "es-AR,es;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
-
-    compras = []
-
-    # Intentar endpoints AJAX conocidos
-    endpoints = [
-        ("POST", "https://prestadores.pami.org.ar/compras_ugl_ajax.php", {"estado":"En curso"}),
-        ("POST", "https://prestadores.pami.org.ar/ajax/get_compras.php", {"estado":"En curso"}),
-        ("GET",  "https://prestadores.pami.org.ar/compras_ugl_json.php", {}),
-        ("GET",  "https://prestadores.pami.org.ar/get_compras_ugl.php",  {}),
-    ]
-
-    for metodo, url, payload in endpoints:
-        try:
-            if metodo == "POST":
-                r = requests.post(url, data=payload, headers=headers, timeout=15)
-            else:
-                r = requests.get(url, headers=headers, timeout=15)
-
-            if r.status_code == 200 and len(r.text) > 200 and "Cargando" not in r.text:
-                # Intentar parsear como JSON
-                try:
-                    data = r.json()
-                    items = data if isinstance(data, list) else data.get("data", data.get("items", []))
-                    for item in items:
-                        texto = normalizar(str(item))
-                        compras.append({
-                            "texto": texto,
-                            "titulo": str(item.get("descripcion", item.get("objeto", ""))[:200]),
-                            "link": item.get("url", item.get("link", URL_PORTAL)),
-                            "pdf": item.get("pdf", item.get("pliego", item.get("archivo", ""))),
-                            "numero": str(item.get("numero", item.get("compulsa", item.get("nro", "")))),
-                            "ugl": str(item.get("ugl", item.get("destino", ""))),
-                            "cierre": str(item.get("cierre", item.get("apertura", ""))),
-                        })
-                    if compras:
-                        print(f"✅ Datos obtenidos de {url} ({len(compras)} compras)")
-                        return compras
-                except:
-                    # Parsear como HTML
-                    soup = BeautifulSoup(r.text, "html.parser")
-                    filas = soup.find_all("tr")
-                    for fila in filas:
-                        texto = normalizar(fila.get_text(" ", strip=True))
-                        if len(texto) < 20:
-                            continue
-                        link_tag = fila.find("a", href=True)
-                        href = link_tag["href"] if link_tag else ""
-                        if href and not href.startswith("http"):
-                            href = URL_BASE + href.lstrip("/")
-                        es_pdf = href.lower().endswith(".pdf")
-                        compras.append({
-                            "texto": texto,
-                            "titulo": texto[:200],
-                            "link": href if href else URL_PORTAL,
-                            "pdf": href if es_pdf else "",
-                            "numero": "",
-                            "ugl": "",
-                            "cierre": "",
-                        })
-                    if compras:
-                        print(f"✅ HTML parseado de {url} ({len(compras)} filas)")
-                        return compras
-        except Exception as e:
-            print(f"⚠️  {url}: {e}")
-
-    # Último recurso: página principal con requests-html simulation
+    url = f"https://www.google.com/search?q={requests.utils.quote(query)}&num=10&hl=es"
+    
     try:
-        r = requests.get(URL_PORTAL, headers=headers, timeout=20)
-        if r.status_code == 200:
-            soup = BeautifulSoup(r.text, "html.parser")
-            texto_completo = normalizar(soup.get_text(" ", strip=True))
+        resp = requests.get(url, headers=headers, timeout=15)
+        if resp.status_code != 200:
+            print(f"Google respondió {resp.status_code} para: {query}")
+            return []
 
-            # Buscar todos los links a PDFs en la página
-            pdfs = []
-            for a in soup.find_all("a", href=True):
-                href = a["href"]
-                if ".pdf" in href.lower() or "pliego" in href.lower() or "compulsa" in href.lower():
-                    if not href.startswith("http"):
-                        href = URL_BASE + href.lstrip("/")
-                    pdfs.append(href)
+        # Extraer links de los resultados
+        links = []
+        # Buscar URLs de prestadores.pami.org.ar en el HTML
+        patron = r'https?://prestadores\.pami\.org\.ar/[^\s"&<>]+'
+        encontrados = re.findall(patron, resp.text)
+        for link in encontrados:
+            # Limpiar la URL
+            link = link.split('"')[0].split("'")[0].split("\\")[0]
+            if link not in links:
+                links.append(link)
+        
+        print(f"  '{query}' → {len(links)} links encontrados")
+        return links
 
-            compras.append({
-                "texto": texto_completo,
-                "titulo": "Contenido completo de la página PAMI",
-                "link": URL_PORTAL,
-                "pdf": pdfs[0] if pdfs else "",
-                "pdfs_extra": pdfs,
-                "numero": "",
-                "ugl": "",
-                "cierre": "",
-            })
-            print(f"✅ Página principal obtenida ({len(texto_completo)} chars, {len(pdfs)} PDFs encontrados)")
-            return compras
     except Exception as e:
-        print(f"❌ Error en página principal: {e}")
+        print(f"  Error buscando '{query}': {e}")
+        return []
 
-    return []
-
-# ── BUSCAR PALABRAS CLAVE ──────────────────────────────────
-def buscar_coincidencias(compras):
-    resultados = []
-    for compra in compras:
-        texto = compra["texto"]
-        encontrados = []
-        for producto, variantes in PALABRAS_CLAVE.items():
-            for v in variantes:
-                if normalizar(v) in texto:
-                    encontrados.append(producto)
-                    break
-        if encontrados:
-            compra["productos"] = encontrados
-            resultados.append(compra)
-    return resultados
-
-# ── DESCARGAR PDF ──────────────────────────────────────────
-def descargar_pdf(url):
-    if not url:
-        return None
+# ── LEER PDF ───────────────────────────────────────────────
+def leer_pdf(url):
+    """Descarga un PDF y extrae su texto."""
     try:
-        r = requests.get(url, timeout=20)
-        if r.status_code == 200 and "pdf" in r.headers.get("Content-Type","").lower():
-            return r.content
-    except:
-        pass
-    return None
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+        }
+        resp = requests.get(url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            return None, None
+        
+        content_type = resp.headers.get("Content-Type", "")
+        
+        # Si es PDF, extraer texto
+        if "pdf" in content_type.lower() or url.lower().endswith(".pdf"):
+            # Usar pdfminer para extraer texto
+            try:
+                import io
+                from pdfminer.high_level import extract_text
+                texto = extract_text(io.BytesIO(resp.content))
+                return texto, resp.content
+            except:
+                # Si no tiene pdfminer, buscar texto básico en el binario
+                texto = resp.content.decode("latin-1", errors="ignore")
+                return texto, resp.content
+        
+        # Si es HTML
+        elif "html" in content_type.lower():
+            from html.parser import HTMLParser
+            class TextExtractor(HTMLParser):
+                def __init__(self):
+                    super().__init__()
+                    self.text = []
+                def handle_data(self, data):
+                    self.text.append(data)
+            parser = TextExtractor()
+            parser.feed(resp.text)
+            return " ".join(parser.text), None
+            
+    except Exception as e:
+        print(f"  Error leyendo {url}: {e}")
+    return None, None
 
-# ── ENVIAR EMAIL ───────────────────────────────────────────
-def enviar_email(asunto, cuerpo_html, adjuntos=None):
+# ── ANALIZAR DOCUMENTO ─────────────────────────────────────
+def analizar_documento(url, texto):
+    """Busca todas las palabras clave en el texto de un documento."""
+    texto_norm = normalizar(texto)
+    productos_encontrados = set()
+    
+    for palabra, producto in PRODUCTO_MAP.items():
+        if normalizar(palabra) in texto_norm:
+            productos_encontrados.add(producto)
+    
+    return list(productos_encontrados)
+
+# ── EXTRAER INFO DEL DOCUMENTO ─────────────────────────────
+def extraer_info(texto):
+    """Extrae número de compulsa, UGL, fecha de cierre del texto."""
+    info = {}
+    texto_norm = texto.upper()
+    
+    # Número de compulsa
+    m = re.search(r'COMPULSA\s+(?:ABREVIADA\s+)?(?:N[°º]?:?\s*)?(\d+)', texto_norm)
+    if m:
+        info["numero"] = m.group(1)
+    
+    # UGL
+    m = re.search(r'UGL[:\s]+(\d+\s*[-–]\s*[A-ZÁÉÍÓÚ\s]+)', texto_norm)
+    if m:
+        info["ugl"] = m.group(1).strip()[:50]
+    
+    # Fecha de cierre/apertura
+    m = re.search(r'APERTURA[:\s]+(?:SE\s+RECIBIR[AÁ]N[^:]+HASTA\s+EL\s+D[IÍ]A\s+)?(\d{1,2}/\d{1,2}/\d{4})', texto_norm)
+    if m:
+        info["cierre"] = m.group(1)
+    
+    # Email de contacto
+    m = re.search(r'[\w\.-]+@pami\.org\.ar', texto.lower())
+    if m:
+        info["email_contacto"] = m.group(0)
+
+    return info
+
+# ── MAIN ───────────────────────────────────────────────────
+def main():
+    fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
+    print(f"=== Monitor PAMI — {fecha} ===")
+
+    # 1. Buscar en Google todas las palabras clave
+    links_encontrados = {}  # url -> set de palabras que la encontraron
+
+    for query in BUSQUEDAS:
+        links = buscar_en_google(query)
+        # Extraer la palabra clave de la query
+        m = re.search(r'"([^"]+)"', query)
+        palabra = m.group(1) if m else query
+        
+        for link in links:
+            if link not in links_encontrados:
+                links_encontrados[link] = set()
+            links_encontrados[link].add(palabra)
+        
+        time.sleep(2)  # Pausa para no saturar Google
+
+    print(f"\nURLs únicas encontradas: {len(links_encontrados)}")
+
+    if not links_encontrados:
+        print("Google no devolvió resultados — enviando email sin coincidencias")
+        enviar_email_sin_coincidencias(fecha)
+        return
+
+    # 2. Leer cada documento y confirmar palabras clave
+    resultados = []
+    urls_procesadas = set()
+
+    for url, palabras_google in links_encontrados.items():
+        if url in urls_procesadas:
+            continue
+        urls_procesadas.add(url)
+        
+        print(f"\nLeyendo: {url}")
+        texto, contenido_pdf = leer_pdf(url)
+        
+        if not texto:
+            print(f"  No se pudo leer el documento")
+            continue
+        
+        # Buscar todas las palabras clave en el documento
+        productos = analizar_documento(url, texto)
+        
+        if productos:
+            info = extraer_info(texto)
+            resultados.append({
+                "url": url,
+                "productos": productos,
+                "numero": info.get("numero", ""),
+                "ugl": info.get("ugl", ""),
+                "cierre": info.get("cierre", ""),
+                "email_contacto": info.get("email_contacto", ""),
+                "pdf_contenido": contenido_pdf,
+                "es_pdf": contenido_pdf is not None,
+            })
+            print(f"  ✅ Encontrado: {', '.join(productos)}")
+        else:
+            print(f"  Sin coincidencias en el documento")
+        
+        time.sleep(1)
+
+    # 3. Enviar email
+    print(f"\nResultados finales: {len(resultados)} documento(s) con coincidencias")
+    
+    if resultados:
+        enviar_email_con_coincidencias(resultados, fecha)
+    else:
+        enviar_email_sin_coincidencias(fecha)
+
+# ── EMAILS ─────────────────────────────────────────────────
+ESTILO = """
+<style>
+  body{font-family:'Helvetica Neue',Arial,sans-serif;background:#f4f6f9;margin:0;padding:0}
+  .wrap{max-width:640px;margin:30px auto;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.1)}
+  .header{background:#1a5276;padding:22px 30px}
+  .header h1{margin:0;color:#fff;font-size:20px}
+  .header p{margin:5px 0 0;color:#aed6f1;font-size:13px}
+  .banner-ok{background:#eafaf1;border-left:4px solid #27ae60;padding:14px 24px}
+  .banner-ok p{margin:0;color:#1e8449;font-size:15px;font-weight:600}
+  .banner-no{background:#fdfefe;border-left:4px solid #85929e;padding:14px 24px}
+  .banner-no p{margin:0;color:#5d6d7e;font-size:15px;font-weight:600}
+  .body{padding:24px 30px}
+  .card{background:#f8fafb;border:1px solid #d5e8d4;border-left:5px solid #27ae60;border-radius:6px;padding:16px 20px;margin-bottom:16px}
+  .tag{display:inline-block;background:#eafaf1;color:#1e8449;padding:2px 10px;border-radius:4px;font-size:13px;margin:2px;font-weight:600}
+  .btn{display:inline-block;padding:10px 22px;border-radius:6px;text-decoration:none;font-size:14px;font-weight:600;margin-top:10px;margin-right:8px}
+  .btn-blue{background:#1a5276;color:#fff!important}
+  .btn-gray{background:#85929e;color:#fff!important}
+  .info{font-size:12px;color:#777;margin:6px 0}
+  .footer{background:#f4f6f9;padding:14px 30px;border-top:1px solid #e8ecf0;text-align:center}
+  .footer p{margin:0;font-size:11px;color:#aaa}
+  ul{padding-left:20px}
+  ul li{margin:4px 0;color:#555;font-size:14px}
+</style>
+"""
+
+def enviar_email_con_coincidencias(resultados, fecha):
+    adjuntos = []
+    cards = ""
+
+    for i, r in enumerate(resultados):
+        tags = "".join(f'<span class="tag">🔍 {p}</span>' for p in r["productos"])
+        
+        info_items = []
+        if r.get("numero"):        info_items.append(f"<b>Compulsa N°:</b> {r['numero']}")
+        if r.get("ugl"):           info_items.append(f"<b>UGL:</b> {r['ugl']}")
+        if r.get("cierre"):        info_items.append(f"<b>Cierre:</b> {r['cierre']}")
+        if r.get("email_contacto"):info_items.append(f"<b>Enviar a:</b> {r['email_contacto']}")
+        info_str = "<br>".join(info_items)
+
+        btn_doc = f'<a href="{r["url"]}" class="btn btn-blue">{"📄 Ver PDF" if r["es_pdf"] else "🔗 Ver documento"}</a>'
+
+        cards += f"""
+        <div class="card">
+          <div style="margin-bottom:8px">{tags}</div>
+          <p class="info">{info_str}</p>
+          {btn_doc}
+        </div>"""
+
+        # Adjuntar PDF si existe
+        if r.get("pdf_contenido") and len(adjuntos) < 5:
+            nombre = f"pliego_{r.get('numero', str(i+1))}.pdf"
+            adjuntos.append((nombre, r["pdf_contenido"]))
+
+    adj_nota = f"<br><span style='font-size:13px;font-weight:normal'>📎 Se adjuntan {len(adjuntos)} PDF(s)</span>" if adjuntos else ""
+
+    html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">{ESTILO}</head><body>
+    <div class="wrap">
+      <div class="header">
+        <h1>🏥 Monitor PAMI — Siprotec</h1>
+        <p>{fecha} | Revisión automática diaria</p>
+      </div>
+      <div class="banner-ok">
+        <p>✅ Se encontraron <strong>{len(resultados)}</strong> documento(s) con productos Siprotec.{adj_nota}</p>
+      </div>
+      <div class="body">
+        <h2 style="color:#1a5276;font-size:15px;margin:0 0 16px">Documentos detectados:</h2>
+        {cards}
+        <div style="margin-top:20px;text-align:center">
+          <a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=2" class="btn btn-gray">🔎 Ver portal PAMI</a>
+        </div>
+      </div>
+      <div class="footer"><p>Monitor automático PAMI · Siprotec S.A. · Revisión diaria 7 AM (ARG)</p></div>
+    </div></body></html>"""
+
+    _enviar(f"✅ PAMI | {len(resultados)} pedido(s) encontrado(s) — {fecha}", html, adjuntos)
+
+def enviar_email_sin_coincidencias(fecha):
+    productos = ["Clip Mitral","Lux Valve","Válvula Tricuspídea","Protector Cerebral Sentinel","Bioadaptador","Ken Valve"]
+    items = "".join(f"<li>{p}</li>" for p in productos)
+
+    html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">{ESTILO}</head><body>
+    <div class="wrap">
+      <div class="header">
+        <h1>🏥 Monitor PAMI — Siprotec</h1>
+        <p>{fecha} | Revisión automática diaria</p>
+      </div>
+      <div class="banner-no">
+        <p>ℹ️ No se encontraron pedidos relevantes hoy.</p>
+      </div>
+      <div class="body">
+        <p style="color:#555;font-size:14px">Productos monitoreados sin resultados:</p>
+        <ul>{items}</ul>
+        <div style="margin-top:20px;text-align:center">
+          <a href="https://prestadores.pami.org.ar/result.php?c=7-5&par=2" class="btn btn-gray">🔗 Ver portal PAMI</a>
+        </div>
+      </div>
+      <div class="footer"><p>Monitor automático PAMI · Siprotec S.A. · Revisión diaria 7 AM (ARG)</p></div>
+    </div></body></html>"""
+
+    _enviar(f"ℹ️ PAMI | Sin pedidos relevantes — {fecha}", html)
+
+def _enviar(asunto, html, adjuntos=None):
     msg = MIMEMultipart("mixed")
     msg["From"]    = EMAIL_ORIGEN
     msg["To"]      = EMAIL_DESTINO
     msg["Subject"] = asunto
-    msg.attach(MIMEText(cuerpo_html, "html", "utf-8"))
+    msg.attach(MIMEText(html, "html", "utf-8"))
 
     if adjuntos:
         for nombre, contenido in adjuntos:
@@ -186,164 +377,7 @@ def enviar_email(asunto, cuerpo_html, adjuntos=None):
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
         server.login(EMAIL_ORIGEN, EMAIL_PASS)
         server.send_message(msg)
-    print(f"✅ Email enviado a {EMAIL_DESTINO}")
-
-# ── TEMPLATES DE EMAIL ─────────────────────────────────────
-ESTILO = """
-<style>
-  body { font-family: 'Helvetica Neue', Arial, sans-serif; background:#f4f6f9; margin:0; padding:0; }
-  .wrap { max-width:640px; margin:30px auto; background:#fff; border-radius:8px;
-          overflow:hidden; box-shadow:0 2px 8px rgba(0,0,0,.1); }
-  .header { background:#1a5276; padding:22px 30px; }
-  .header h1 { margin:0; color:#fff; font-size:20px; }
-  .header p  { margin:5px 0 0; color:#aed6f1; font-size:13px; }
-  .banner-ok  { background:#eafaf1; border-left:4px solid #27ae60; padding:14px 24px; }
-  .banner-ok p { margin:0; color:#1e8449; font-size:15px; font-weight:600; }
-  .banner-no  { background:#fdfefe; border-left:4px solid #85929e; padding:14px 24px; }
-  .banner-no p { margin:0; color:#5d6d7e; font-size:15px; font-weight:600; }
-  .body { padding:24px 30px; }
-  .card { background:#f8fafb; border:1px solid #d5e8d4; border-left:5px solid #27ae60;
-          border-radius:6px; padding:16px 20px; margin-bottom:16px; }
-  .tag  { display:inline-block; background:#eafaf1; color:#1e8449; padding:2px 10px;
-          border-radius:4px; font-size:13px; margin:2px; font-weight:600; }
-  .btn  { display:inline-block; padding:10px 22px; border-radius:6px; text-decoration:none;
-          font-size:14px; font-weight:600; margin-top:10px; margin-right:8px; }
-  .btn-blue { background:#1a5276; color:#fff !important; }
-  .btn-gray { background:#85929e; color:#fff !important; }
-  .info { font-size:12px; color:#777; margin:6px 0; font-style:italic; }
-  .footer { background:#f4f6f9; padding:14px 30px; border-top:1px solid #e8ecf0; text-align:center; }
-  .footer p { margin:0; font-size:11px; color:#aaa; }
-  ul { padding-left:20px; }
-  ul li { margin:4px 0; color:#555; font-size:14px; }
-</style>
-"""
-
-def email_con_coincidencias(coincidencias, fecha, adjuntos):
-    cards = ""
-    for c in coincidencias:
-        tags = "".join(f'<span class="tag">🔍 {p}</span>' for p in c["productos"])
-        info = []
-        if c.get("ugl"):    info.append(f"<b>UGL:</b> {c['ugl']}")
-        if c.get("numero"): info.append(f"<b>N°:</b> {c['numero']}")
-        if c.get("cierre"): info.append(f"<b>Cierre:</b> {c['cierre']}")
-        info_str = " &nbsp;|&nbsp; ".join(info) if info else ""
-
-        btn_pdf  = f'<a href="{c["pdf"]}" class="btn btn-blue">📄 Descargar PDF</a>' if c.get("pdf") else ""
-        btn_link = f'<a href="{c["link"]}" class="btn btn-gray">🔗 Ver en PAMI</a>' if c.get("link") else ""
-
-        cards += f"""
-        <div class="card">
-          <div>{tags}</div>
-          {f'<p class="info">{info_str}</p>' if info_str else ''}
-          <p class="info">{c['titulo'][:200]}</p>
-          {btn_pdf}{btn_link}
-        </div>"""
-
-    adj_nota = f"<br><span style='font-size:13px;font-weight:normal;'>📎 Se adjuntan {len(adjuntos)} pliego(s) PDF.</span>" if adjuntos else ""
-
-    return f"""<!DOCTYPE html><html><head><meta charset='UTF-8'>{ESTILO}</head><body>
-    <div class='wrap'>
-      <div class='header'>
-        <h1>🏥 Monitor PAMI — Siprotec</h1>
-        <p>{fecha} | Revisión automática diaria</p>
-      </div>
-      <div class='banner-ok'>
-        <p>✅ Se encontraron <strong>{len(coincidencias)}</strong> compra(s) con productos Siprotec.{adj_nota}</p>
-      </div>
-      <div class='body'>
-        <h2 style='color:#1a5276;font-size:15px;margin:0 0 16px;'>Compras detectadas:</h2>
-        {cards}
-        <div style='margin-top:20px;text-align:center;'>
-          <a href='{URL_PORTAL}' class='btn btn-gray'>🔎 Ver todos los pedidos en PAMI</a>
-        </div>
-      </div>
-      <div class='footer'><p>Monitor automático PAMI · Siprotec S.A. · Revisión diaria 7 AM (ARG)</p></div>
-    </div></body></html>"""
-
-def email_sin_coincidencias(total, fecha):
-    items = "".join(f"<li>{p}</li>" for p in PALABRAS_CLAVE.keys())
-    return f"""<!DOCTYPE html><html><head><meta charset='UTF-8'>{ESTILO}</head><body>
-    <div class='wrap'>
-      <div class='header'>
-        <h1>🏥 Monitor PAMI — Siprotec</h1>
-        <p>{fecha} | Revisión automática diaria</p>
-      </div>
-      <div class='banner-no'>
-        <p>ℹ️ No hay pedidos relevantes hoy.
-        <br><span style='font-size:13px;font-weight:normal;'>Se revisaron <strong>{total}</strong> compra(s) vigente(s).</span></p>
-      </div>
-      <div class='body'>
-        <p style='color:#555;font-size:14px;'>Productos monitoreados sin resultados:</p>
-        <ul>{items}</ul>
-        <div style='margin-top:20px;text-align:center;'>
-          <a href='{URL_PORTAL}' class='btn btn-gray'>🔗 Ver portal PAMI</a>
-        </div>
-      </div>
-      <div class='footer'><p>Monitor automático PAMI · Siprotec S.A. · Revisión diaria 7 AM (ARG)</p></div>
-    </div></body></html>"""
-
-def email_sin_datos(fecha):
-    return f"""<!DOCTYPE html><html><head><meta charset='UTF-8'>{ESTILO}</head><body>
-    <div class='wrap'>
-      <div class='header'>
-        <h1>🏥 Monitor PAMI — Siprotec</h1>
-        <p>{fecha} | Revisión automática diaria</p>
-      </div>
-      <div style='background:#fef9e7;border-left:4px solid #e67e22;padding:14px 24px;'>
-        <p style='margin:0;color:#9a5500;font-size:15px;font-weight:600;'>
-          ⚠️ No se pudieron obtener datos del portal PAMI hoy.
-        </p>
-      </div>
-      <div class='body'>
-        <p style='color:#555;font-size:14px;'>
-          El portal carga sus datos dinámicamente. Por favor revisá manualmente:
-        </p>
-        <div style='text-align:center;margin-top:16px;'>
-          <a href='{URL_PORTAL}' class='btn btn-blue'>🔗 Ir al portal PAMI</a>
-        </div>
-      </div>
-      <div class='footer'><p>Monitor automático PAMI · Siprotec S.A. · Revisión diaria 7 AM (ARG)</p></div>
-    </div></body></html>"""
-
-# ── MAIN ───────────────────────────────────────────────────
-def main():
-    fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
-    print(f"=== Monitor PAMI — {fecha} ===")
-
-    compras = obtener_compras()
-
-    if not compras:
-        print("❌ No se pudieron obtener datos")
-        enviar_email(
-            f"⚠️ PAMI | Sin datos — {fecha}",
-            email_sin_datos(fecha)
-        )
-        return
-
-    coincidencias = buscar_coincidencias(compras)
-    print(f"Compras revisadas: {len(compras)} | Coincidencias: {len(coincidencias)}")
-
-    if coincidencias:
-        # Intentar descargar PDFs
-        adjuntos = []
-        for c in coincidencias:
-            if c.get("pdf"):
-                contenido = descargar_pdf(c["pdf"])
-                if contenido:
-                    nombre = f"pliego_{c.get('numero','pami')}.pdf"
-                    adjuntos.append((nombre, contenido))
-                    print(f"📎 PDF descargado: {nombre}")
-
-        enviar_email(
-            f"✅ PAMI | {len(coincidencias)} pedido(s) encontrado(s) — {fecha}",
-            email_con_coincidencias(coincidencias, fecha, adjuntos),
-            adjuntos if adjuntos else None
-        )
-    else:
-        enviar_email(
-            f"ℹ️ PAMI | Sin pedidos relevantes — {fecha}",
-            email_sin_coincidencias(len(compras), fecha)
-        )
+    print(f"✅ Email enviado a {EMAIL_DESTINO}: {asunto}")
 
 if __name__ == "__main__":
     main()
