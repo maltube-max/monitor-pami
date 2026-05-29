@@ -30,7 +30,7 @@ PALABRAS_CLAVE = {
     "Clip Mitral":                 ["clip mitral", "mitraclip", "mitra clip", "clips mitrales", "reparacion valvular mitral", "reparacion percutanea valvular mitral", "reparacion mitral", "jensclip", "cierre borde a borde"],
     "Lux Valve":                   ["lux valve", "lux value"],
     "Válvula Tricuspídea":         ["tricuspide", "tricuspidea", "valvula tricuspide"],
-    "Protector Cerebral Sentinel": ["sentinel", "protector cerebral", "filtro proteccion embolica", "filtro embolica", "filtro embolico", "proteccion embolica", "protección embólica", "filtro de proteccion"],
+    "Protector Cerebral Sentinel": ["sentinel", "protector cerebral", "filtro proteccion embolica", "filtro embolica", "filtro embolico", "proteccion embolica", "protección embólica", "filtro de proteccion", "sistema de proteccion cerebral", "proteccion cerebral bicarotideo", "sistema proteccion cerebral", "proteccion cerebral"],
     "Bioadaptador":                ["bioadaptador", "bio adaptador"],
     "Ken Valve":                   ["ken valve"],
 }
