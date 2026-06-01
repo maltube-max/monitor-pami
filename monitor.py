@@ -168,7 +168,7 @@ def obtener_compras(driver, nombre, url, par):
                     if r_archivos.status_code == 200:
                         html_archivos = r_archivos.text
                         # Buscar links a PDFs en la pagina
-                        links_pdf = re.findall(r'href=["']([^"']*(?:institucional\.pami|\.pdf)[^"']*)["']', html_archivos, re.IGNORECASE)
+                        links_pdf = re.findall(r'https://institucional[.]pami[.]org[.]ar[^\s"]*[.]pdf', html_archivos, re.IGNORECASE)
                         for link_pdf in links_pdf:
                             if not link_pdf.startswith("http"):
                                 link_pdf = "https://institucional.pami.org.ar/" + link_pdf.lstrip("/")
