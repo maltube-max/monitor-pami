@@ -159,17 +159,46 @@ def obtener_compras(driver, nombre, url, par):
             # Si no encontro en la fila pero tiene ID, leer el documento
             if not productos and id_archivo:
                 try:
-                    url_doc = f"https://prestadores.pami.org.ar/compras_ver_archivos.php?id={id_archivo}"
-                    r_doc = requests.get(url_doc, timeout=15, headers={
+                    # Abrir la pagina de archivos para obtener el link real al PDF
+                    url_archivos = f"https://prestadores.pami.org.ar/compras_ver_archivos.php?id={id_archivo}"
+                    r_archivos = requests.get(url_archivos, timeout=15, headers={
                         "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
                     })
-                    if r_doc.status_code == 200:
-                        texto_doc = re.sub(r'<[^>]+>', ' ', r_doc.text)
-                        texto_doc = re.sub(r'\s+', ' ', texto_doc).strip()
-                        productos = detectar_productos(texto_doc)
+                    texto_buscar = ""
+                    if r_archivos.status_code == 200:
+                        html_archivos = r_archivos.text
+                        # Buscar links a PDFs en la pagina
+                        links_pdf = re.findall(r'href=["']([^"']*(?:institucional\.pami|\.pdf)[^"']*)["']', html_archivos, re.IGNORECASE)
+                        for link_pdf in links_pdf:
+                            if not link_pdf.startswith("http"):
+                                link_pdf = "https://institucional.pami.org.ar/" + link_pdf.lstrip("/")
+                            try:
+                                r_pdf = requests.get(link_pdf, timeout=15, headers={
+                                    "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
+                                })
+                                if r_pdf.status_code == 200:
+                                    ct = r_pdf.headers.get("Content-Type","")
+                                    if "pdf" in ct.lower():
+                                        try:
+                                            from pdfminer.high_level import extract_text as pdf_extract
+                                            texto_buscar = pdf_extract(io.BytesIO(r_pdf.content))
+                                        except:
+                                            texto_buscar = r_pdf.content.decode("latin-1", errors="ignore")
+                                    else:
+                                        texto_buscar = re.sub(r'<[^>]+>', ' ', r_pdf.text)
+                                    break
+                            except:
+                                pass
+                        # Si no encontro PDF, buscar en el HTML de la pagina de archivos
+                        if not texto_buscar:
+                            texto_buscar = re.sub(r'<[^>]+>', ' ', html_archivos)
+                    
+                    if texto_buscar:
+                        texto_buscar = re.sub(r'\s+', ' ', texto_buscar).strip()
+                        productos = detectar_productos(texto_buscar)
                         if productos:
                             print(f"  Encontrado en documento {id_archivo}: {', '.join(productos)}")
-                            texto_fila = texto_fila + " " + texto_doc[:500]
+                            texto_fila = texto_fila + " " + texto_buscar[:500]
                 except Exception as e:
                     print(f"  Error leyendo doc {id_archivo}: {e}")
 
