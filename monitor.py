@@ -143,7 +143,36 @@ def obtener_compras(driver, nombre, url, par):
             if es_fila_formulario(texto_fila):
                 continue
 
+            # Buscar el ID de verArchivos en esta fila
+            id_archivo = ""
+            elementos_onclick = fila.find_elements(By.XPATH, ".//*[@onclick]")
+            for elem in elementos_onclick:
+                onclick = elem.get_attribute("onclick") or ""
+                m_id = re.search(r"verArchivos\(\'(\d+)\'\)", onclick)
+                if m_id:
+                    id_archivo = m_id.group(1)
+                    break
+
+            # Buscar palabras clave en el texto de la fila
             productos = detectar_productos(texto_fila)
+
+            # Si no encontro en la fila pero tiene ID, leer el documento
+            if not productos and id_archivo:
+                try:
+                    url_doc = f"https://prestadores.pami.org.ar/compras_ver_archivos.php?id={id_archivo}"
+                    r_doc = requests.get(url_doc, timeout=15, headers={
+                        "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
+                    })
+                    if r_doc.status_code == 200:
+                        texto_doc = re.sub(r'<[^>]+>', ' ', r_doc.text)
+                        texto_doc = re.sub(r'\s+', ' ', texto_doc).strip()
+                        productos = detectar_productos(texto_doc)
+                        if productos:
+                            print(f"  Encontrado en documento {id_archivo}: {', '.join(productos)}")
+                            texto_fila = texto_fila + " " + texto_doc[:500]
+                except Exception as e:
+                    print(f"  Error leyendo doc {id_archivo}: {e}")
+
             if not productos:
                 continue
 
