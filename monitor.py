@@ -33,6 +33,8 @@ PALABRAS_CLAVE = {
     "Protector Cerebral Sentinel": ["sentinel", "protector cerebral", "filtro proteccion embolica", "filtro embolica", "filtro embolico", "proteccion embolica", "protección embólica", "filtro de proteccion", "sistema de proteccion cerebral", "proteccion cerebral bicarotideo", "sistema proteccion cerebral", "proteccion cerebral"],
     "Bioadaptador":                ["bioadaptador", "bio adaptador"],
     "Ken Valve":                   ["ken valve"],
+    "Cierre Percutáneo":           ["manta", "proglide", "prostar", "obtura", "clothoid", "cierre percutaneo", "dispositivo de cierre percutaneo", "dispositivo de cierre vascular", "cierre vascular"],
+
 }
 
 IGNORAR_SI_CONTIENE = [
