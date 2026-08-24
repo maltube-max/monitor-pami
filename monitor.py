@@ -230,7 +230,42 @@ def obtener_compras(driver, nombre, url, par):
             )
         except:
             pass
-        time.sleep(5)
+
+        # Espera dinamica: la tabla de PAMI carga por AJAX y el numero de
+        # filas puede variar mucho segun cuanto tarde en terminar de cargar.
+        # En vez de un sleep fijo, esperamos hasta que el conteo de filas
+        # se estabilice (no crezca) durante varias verificaciones seguidas.
+        estable_desde = 0
+        anterior = -1
+        intentos = 0
+        max_intentos = 40  # hasta ~80s de espera total
+        while intentos < max_intentos:
+            actual = len(driver.find_elements(By.TAG_NAME, "tr"))
+            if actual == anterior and actual > 0:
+                estable_desde += 1
+            else:
+                estable_desde = 0
+            anterior = actual
+            if estable_desde >= 4:  # 4 chequeos seguidos sin cambios = estable
+                break
+            time.sleep(2)
+            intentos += 1
+
+        # Intentar cargar mas filas si hay paginacion / boton "cargar mas"
+        for _ in range(10):
+            try:
+                boton_mas = driver.find_element(By.XPATH,
+                    "//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'siguiente')] | "
+                    "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'cargar mas')] | "
+                    "//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'cargar mas')]"
+                )
+                if boton_mas.is_displayed():
+                    driver.execute_script("arguments[0].click();", boton_mas)
+                    time.sleep(3)
+                else:
+                    break
+            except Exception:
+                break
 
         filas = driver.find_elements(By.TAG_NAME, "tr")
         print(f"  Total filas: {len(filas)}")
