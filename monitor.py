@@ -270,6 +270,22 @@ def obtener_compras(driver, nombre, url, par):
         filas = driver.find_elements(By.TAG_NAME, "tr")
         print(f"  Total filas: {len(filas)}")
 
+        # --- DIAGNOSTICO TEMPORAL ---
+        # Busca si el numero de compulsa o expediente puntual aparece en
+        # CUALQUIER fila leida, sin importar si matchea keywords o no.
+        # Esto permite distinguir "no llegamos a leer esa fila" de
+        # "la leimos pero algo la filtro".
+        ids_diagnostico = ["821/26", "76672903", "521142"]
+        for i, fila in enumerate(filas):
+            try:
+                txt = fila.text.strip()
+            except Exception:
+                continue
+            for id_diag in ids_diagnostico:
+                if id_diag in txt:
+                    print(f"  🔎 DIAGNOSTICO: fila {i} contiene '{id_diag}': {txt[:250]}")
+        # --- FIN DIAGNOSTICO ---
+
         for i, fila in enumerate(filas):
             texto_fila = fila.text.strip()
             if len(texto_fila) < 10:
