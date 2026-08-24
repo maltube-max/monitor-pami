@@ -43,6 +43,17 @@ IGNORAR_SI_CONTIENE = [
     "licitación publica", "contratación directa", "descripción\nfecha"
 ]
 
+# Patrones de endpoint donde PAMI puede publicar la pagina de "ver archivos"
+# de una compulsa. Se prueban en orden hasta que uno responda 200.
+PLANTILLAS_VER_ARCHIVOS = [
+    "https://prestadores.pami.org.ar/compras_ver_archivos.php?id={id}",
+    "https://prestadores.pami.org.ar/compras_ver_archivo.php?id={id}",
+    "https://prestadores.pami.org.ar/ver_archivos.php?id={id}",
+    "https://prestadores.pami.org.ar/compras_archivos.php?id={id}",
+]
+
+HEADERS_HTTP = {"User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"}
+
 def normalizar(texto):
     texto = texto.lower()
     for a, b in [("á","a"),("é","e"),("í","i"),("ó","o"),("ú","u"),("ü","u"),("ñ","n")]:
@@ -73,7 +84,6 @@ def iniciar_browser():
     opciones.add_argument("--disable-dev-shm-usage")
     opciones.add_argument("--disable-gpu")
     opciones.add_argument("--window-size=1920,1080")
-    # Configurar carpeta de descargas
     prefs = {"download.default_directory": "/tmp/pami_downloads",
              "download.prompt_for_download": False,
              "plugins.always_open_pdf_externally": True}
@@ -85,7 +95,6 @@ def obtener_url_desde_onclick(onclick_str):
     """Extrae la URL de un string onclick de PAMI."""
     if not onclick_str:
         return ""
-    # Patrones comunes en PAMI
     patrones = [
         r"window\.open\(['\"]([^'\"]+)['\"]",
         r"location\.href\s*=\s*['\"]([^'\"]+)['\"]",
@@ -99,6 +108,94 @@ def obtener_url_desde_onclick(onclick_str):
             if not url.startswith("http"):
                 url = "https://prestadores.pami.org.ar/" + url.lstrip("/")
             return url
+    return ""
+
+def extraer_links_documento(html, base_url):
+    """
+    Busca links a documentos (pdf/doc/docx) dentro de una pagina HTML.
+    - Acepta http Y https (bug anterior: solo aceptaba https).
+    - Acepta el dominio institucional.pami.org.ar y prestadores.pami.org.ar.
+    - Tambien resuelve links relativos usando base_url.
+    """
+    links = set()
+
+    # 1) Links absolutos con dominio conocido de PAMI, http o https, terminados en pdf/doc/docx
+    for m in re.finditer(
+        r'https?://(?:institucional|prestadores|www)[.]pami[.]org[.]ar[^\s"\'<>]*\.(?:pdf|docx?|PDF|DOCX?)',
+        html
+    ):
+        links.add(m.group(0))
+
+    # 2) Cualquier href/src que termine en esas extensiones, aunque sea de otro host
+    for m in re.finditer(r'(?:href|src)\s*=\s*["\']([^"\']+\.(?:pdf|docx?|PDF|DOCX?))["\']', html):
+        url = m.group(1)
+        if not url.startswith("http"):
+            # resolver relativo contra el dominio base
+            if url.startswith("//"):
+                url = "https:" + url
+            elif url.startswith("/"):
+                url = "https://institucional.pami.org.ar" + url
+            else:
+                url = base_url.rsplit("/", 1)[0] + "/" + url
+        links.add(url)
+
+    return list(links)
+
+def leer_texto_documento(id_archivo):
+    """
+    Intenta abrir la pagina de 'ver archivos' de una compulsa probando
+    varias plantillas de endpoint, y si encuentra un link a documento,
+    lo descarga y extrae el texto (pdf/doc/docx). Devuelve el texto o "".
+    """
+    for plantilla in PLANTILLAS_VER_ARCHIVOS:
+        url_archivos = plantilla.format(id=id_archivo)
+        try:
+            r_archivos = requests.get(url_archivos, timeout=15, headers=HEADERS_HTTP)
+        except Exception:
+            continue
+        if r_archivos.status_code != 200:
+            continue
+
+        html_archivos = r_archivos.text
+        links_doc = extraer_links_documento(html_archivos, url_archivos)
+
+        for link_doc in links_doc:
+            try:
+                r_doc = requests.get(link_doc, timeout=20, headers=HEADERS_HTTP)
+                if r_doc.status_code != 200:
+                    continue
+                ct = r_doc.headers.get("Content-Type", "").lower()
+                contenido = r_doc.content
+
+                if "pdf" in ct or link_doc.lower().endswith(".pdf"):
+                    try:
+                        from pdfminer.high_level import extract_text as pdf_extract
+                        return pdf_extract(io.BytesIO(contenido))
+                    except Exception:
+                        return contenido.decode("latin-1", errors="ignore")
+
+                if "word" in ct or link_doc.lower().endswith((".doc", ".docx")):
+                    try:
+                        import docx
+                        doc = docx.Document(io.BytesIO(contenido))
+                        return "\n".join(p.text for p in doc.paragraphs)
+                    except Exception:
+                        return contenido.decode("latin-1", errors="ignore")
+
+                # Contenido desconocido pero descargable: lo devolvemos como texto plano
+                if len(contenido) > 500:
+                    return re.sub(r'<[^>]+>', ' ', r_doc.text)
+            except Exception:
+                continue
+
+        # No encontramos un documento descargable: al menos devolvemos el
+        # texto plano de la pagina de "ver archivos" (puede tener el detalle)
+        if not links_doc:
+            texto_plano = re.sub(r'<[^>]+>', ' ', html_archivos)
+            texto_plano = re.sub(r'\s+', ' ', texto_plano).strip()
+            if len(texto_plano) > 50:
+                return texto_plano
+
     return ""
 
 def obtener_compras(driver, nombre, url, par):
@@ -158,43 +255,10 @@ def obtener_compras(driver, nombre, url, par):
             # Buscar palabras clave en el texto de la fila
             productos = detectar_productos(texto_fila)
 
-            # Si no encontro en la fila pero tiene ID, leer el documento
+            # Si no encontro en la fila pero tiene ID, leer el documento real
             if not productos and id_archivo:
                 try:
-                    # Abrir la pagina de archivos para obtener el link real al PDF
-                    url_archivos = f"https://prestadores.pami.org.ar/compras_ver_archivos.php?id={id_archivo}"
-                    r_archivos = requests.get(url_archivos, timeout=15, headers={
-                        "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
-                    })
-                    texto_buscar = ""
-                    if r_archivos.status_code == 200:
-                        html_archivos = r_archivos.text
-                        # Buscar links a PDFs en la pagina
-                        links_pdf = re.findall(r'https://institucional[.]pami[.]org[.]ar[^\s"]*[.]pdf', html_archivos, re.IGNORECASE)
-                        for link_pdf in links_pdf:
-                            if not link_pdf.startswith("http"):
-                                link_pdf = "https://institucional.pami.org.ar/" + link_pdf.lstrip("/")
-                            try:
-                                r_pdf = requests.get(link_pdf, timeout=15, headers={
-                                    "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
-                                })
-                                if r_pdf.status_code == 200:
-                                    ct = r_pdf.headers.get("Content-Type","")
-                                    if "pdf" in ct.lower():
-                                        try:
-                                            from pdfminer.high_level import extract_text as pdf_extract
-                                            texto_buscar = pdf_extract(io.BytesIO(r_pdf.content))
-                                        except:
-                                            texto_buscar = r_pdf.content.decode("latin-1", errors="ignore")
-                                    else:
-                                        texto_buscar = re.sub(r'<[^>]+>', ' ', r_pdf.text)
-                                    break
-                            except:
-                                pass
-                        # Si no encontro PDF, buscar en el HTML de la pagina de archivos
-                        if not texto_buscar:
-                            texto_buscar = re.sub(r'<[^>]+>', ' ', html_archivos)
-                    
+                    texto_buscar = leer_texto_documento(id_archivo)
                     if texto_buscar:
                         texto_buscar = re.sub(r'\s+', ' ', texto_buscar).strip()
                         productos = detectar_productos(texto_buscar)
@@ -238,27 +302,23 @@ def obtener_compras(driver, nombre, url, par):
             if m:
                 desc = m.group(1).strip()[:150]
 
-            # Buscar el ícono del ojo (remove_red_eye) en la fila
-            # y obtener su URL via onclick o href
             link_ojo = ""
             link_doc = ""
             pdf_bytes = None
 
-            # Buscar todos los elementos clickeables en la fila
-            elementos_clickeables = fila.find_elements(By.XPATH, 
+            elementos_clickeables = fila.find_elements(By.XPATH,
                 ".//*[@onclick] | .//a[@href] | .//i | .//span[@class] | .//button"
             )
-            
+
             for elem in elementos_clickeables:
                 tag = elem.tag_name
                 clase = elem.get_attribute("class") or ""
                 onclick = elem.get_attribute("onclick") or ""
                 href = elem.get_attribute("href") or ""
                 texto_elem = elem.text.strip()
-                
+
                 print(f"    Elem: tag={tag} class={clase} text={texto_elem} onclick={onclick[:100]} href={href[:100]}")
-                
-                # El ícono del ojo en Material Icons se llama "remove_red_eye" o "visibility"
+
                 if any(x in clase.lower() for x in ["eye", "ver", "visibility", "remove_red"]) or \
                    any(x in texto_elem.lower() for x in ["remove_red_eye", "visibility"]) or \
                    "remove_red_eye" in onclick:
@@ -267,7 +327,6 @@ def obtener_compras(driver, nombre, url, par):
                         link_ojo = url_ojo
                         print(f"    ✅ Link ojo: {link_ojo}")
 
-                # El ícono del documento se llama "description" en Material Icons
                 if any(x in clase.lower() for x in ["description", "doc", "file", "pdf"]) or \
                    any(x in texto_elem.lower() for x in ["description"]) or \
                    "description" in onclick:
@@ -276,22 +335,17 @@ def obtener_compras(driver, nombre, url, par):
                         link_doc = url_doc
                         print(f"    ✅ Link doc: {link_doc}")
 
-                # Cualquier onclick con URL
                 if onclick and not link_ojo:
                     url_onclick = obtener_url_desde_onclick(onclick)
                     if url_onclick and "result.php" not in url_onclick:
                         link_ojo = url_onclick
                         print(f"    ✅ Link onclick genérico: {link_ojo}")
 
-            # Usar link_ojo primero, si no link_doc
             link_final = link_ojo or link_doc
 
-            # Si encontramos un link, intentar descargar
             if link_final:
                 try:
-                    r = requests.get(link_final, timeout=20, headers={
-                        "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
-                    })
+                    r = requests.get(link_final, timeout=20, headers=HEADERS_HTTP)
                     if r.status_code == 200:
                         ct = r.headers.get("Content-Type", "")
                         if "pdf" in ct.lower() or "word" in ct.lower() or "octet" in ct.lower() or len(r.content) > 10000:
@@ -300,7 +354,19 @@ def obtener_compras(driver, nombre, url, par):
                 except Exception as e:
                     print(f"  Error descargando: {e}")
 
-            # Si no pudimos descargar, al menos guardamos el link
+            if not link_final and id_archivo:
+                # Fallback: si no hay link_ojo/link_doc, apuntar directo a la pagina
+                # de ver archivos (la primera plantilla que respondio 200)
+                for plantilla in PLANTILLAS_VER_ARCHIVOS:
+                    posible = plantilla.format(id=id_archivo)
+                    try:
+                        rr = requests.head(posible, timeout=10, headers=HEADERS_HTTP)
+                        if rr.status_code == 200:
+                            link_final = posible
+                            break
+                    except Exception:
+                        continue
+
             if not link_final:
                 link_final = url  # fallback al buscador
 
@@ -329,7 +395,6 @@ def main():
     fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
     print(f"=== Monitor PAMI — {fecha} ===")
 
-    # Crear carpeta de descargas
     os.makedirs("/tmp/pami_downloads", exist_ok=True)
 
     driver = iniciar_browser()
@@ -348,7 +413,6 @@ def main():
     finally:
         driver.quit()
 
-    # Deduplicar
     vistos = set()
     resultados_unicos = []
     for r in resultados:
