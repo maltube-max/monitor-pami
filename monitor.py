@@ -141,72 +141,110 @@ def extraer_links_documento(html, base_url):
 
     return list(links)
 
-def leer_texto_documento(id_archivo):
-    """
-    Intenta abrir la pagina de 'ver archivos' de una compulsa probando
-    varias plantillas de endpoint, y si encuentra un link a documento,
-    lo descarga y extrae el texto (pdf/doc/docx). Devuelve el texto o "".
-    """
-    print(f"    [DIAG-DOC] Intentando leer documento id={id_archivo}")
-    for plantilla in PLANTILLAS_VER_ARCHIVOS:
-        url_archivos = plantilla.format(id=id_archivo)
+def _descargar_y_extraer(url, cookies):
+    """Descarga un link (pdf/doc/html) con las cookies de la sesion del
+    browser y devuelve el texto extraido, o "" si falla."""
+    try:
+        r = requests.get(url, cookies=cookies, timeout=20, headers=HEADERS_HTTP)
+    except Exception as e:
+        print(f"    [DIAG-DOC] error request {url}: {e}")
+        return ""
+    if r.status_code != 200:
+        print(f"    [DIAG-DOC] {url} -> status {r.status_code}")
+        return ""
+    ct = r.headers.get("Content-Type", "").lower()
+    contenido = r.content
+    if "pdf" in ct or url.lower().endswith(".pdf"):
         try:
-            r_archivos = requests.get(url_archivos, timeout=15, headers=HEADERS_HTTP)
+            from pdfminer.high_level import extract_text as pdf_extract
+            texto = pdf_extract(io.BytesIO(contenido))
+            print(f"    [DIAG-DOC] PDF ok ({url}): {len(texto)} caracteres")
+            return texto
         except Exception as e:
-            print(f"    [DIAG-DOC] {url_archivos} -> ERROR request: {e}")
-            continue
-        print(f"    [DIAG-DOC] {url_archivos} -> status {r_archivos.status_code}, len={len(r_archivos.text)}")
-        if r_archivos.status_code != 200:
-            continue
-
-        html_archivos = r_archivos.text
-        links_doc = extraer_links_documento(html_archivos, url_archivos)
-        print(f"    [DIAG-DOC] links de documento encontrados: {links_doc}")
-
-        for link_doc in links_doc:
-            try:
-                r_doc = requests.get(link_doc, timeout=20, headers=HEADERS_HTTP)
-                print(f"    [DIAG-DOC] descarga {link_doc} -> status {r_doc.status_code}, "
-                      f"content-type={r_doc.headers.get('Content-Type','')}, bytes={len(r_doc.content)}")
-                if r_doc.status_code != 200:
-                    continue
-                ct = r_doc.headers.get("Content-Type", "").lower()
-                contenido = r_doc.content
-
-                if "pdf" in ct or link_doc.lower().endswith(".pdf"):
-                    try:
-                        from pdfminer.high_level import extract_text as pdf_extract
-                        texto = pdf_extract(io.BytesIO(contenido))
-                        print(f"    [DIAG-DOC] texto extraido de PDF: {len(texto)} caracteres")
-                        return texto
-                    except Exception as e:
-                        print(f"    [DIAG-DOC] fallo pdfminer: {e}")
-                        return contenido.decode("latin-1", errors="ignore")
-
-                if "word" in ct or link_doc.lower().endswith((".doc", ".docx")):
-                    try:
-                        import docx
-                        doc = docx.Document(io.BytesIO(contenido))
-                        return "\n".join(p.text for p in doc.paragraphs)
-                    except Exception as e:
-                        print(f"    [DIAG-DOC] fallo lectura docx: {e}")
-                        return contenido.decode("latin-1", errors="ignore")
-
-                if len(contenido) > 500:
-                    return re.sub(r'<[^>]+>', ' ', r_doc.text)
-            except Exception as e:
-                print(f"    [DIAG-DOC] error descargando {link_doc}: {e}")
-                continue
-
-        if not links_doc:
-            texto_plano = re.sub(r'<[^>]+>', ' ', html_archivos)
-            texto_plano = re.sub(r'\s+', ' ', texto_plano).strip()
-            print(f"    [DIAG-DOC] sin links de documento, texto plano de la pagina: {len(texto_plano)} caracteres")
-            if len(texto_plano) > 50:
-                return texto_plano
-
-    print(f"    [DIAG-DOC] no se pudo leer ningun documento para id={id_archivo}")
+            print(f"    [DIAG-DOC] fallo pdfminer en {url}: {e}")
+            return ""
+    if "word" in ct or url.lower().endswith((".doc", ".docx")):
+        try:
+            import docx
+            doc = docx.Document(io.BytesIO(contenido))
+            return "\n".join(p.text for p in doc.paragraphs)
+        except Exception as e:
+            print(f"    [DIAG-DOC] fallo docx en {url}: {e}")
+            return ""
+    if len(contenido) > 500:
+        return re.sub(r'<[^>]+>', ' ', r.text)
     return ""
+
+def leer_documento_via_click(driver, elem_trigger, timeout=10):
+    """
+    En vez de adivinar la URL del endpoint (demostrado que falla: 100% 404
+    en todas las variantes probadas), usamos el propio browser autenticado
+    para hacer click en el icono real (ojo/descripcion) y ver que abre PAMI
+    de verdad: pestaña nueva o un modal en la misma pagina.
+    """
+    texto = ""
+    ventanas_antes = driver.window_handles
+    ventana_original = driver.current_window_handle
+
+    try:
+        driver.execute_script("arguments[0].scrollIntoView(true);", elem_trigger)
+        driver.execute_script("arguments[0].click();", elem_trigger)
+    except Exception as e:
+        print(f"    [DIAG-DOC] error al clickear elemento: {e}")
+        return ""
+
+    time.sleep(2)
+    ventanas_despues = driver.window_handles
+    cookies = {c['name']: c['value'] for c in driver.get_cookies()}
+
+    if len(ventanas_despues) > len(ventanas_antes):
+        nueva = [w for w in ventanas_despues if w not in ventanas_antes][0]
+        driver.switch_to.window(nueva)
+        try:
+            WebDriverWait(driver, timeout).until(
+                lambda d: d.execute_script("return document.readyState") == "complete")
+        except Exception:
+            pass
+        url_actual = driver.current_url
+        print(f"    [DIAG-DOC] pestaña nueva: {url_actual}")
+
+        if url_actual.lower().endswith(".pdf") or "pdf" in url_actual.lower():
+            texto = _descargar_y_extraer(url_actual, cookies)
+        else:
+            html = driver.page_source
+            links_doc = extraer_links_documento(html, url_actual)
+            print(f"    [DIAG-DOC] links en pestaña nueva: {links_doc}")
+            for link_doc in links_doc:
+                texto = _descargar_y_extraer(link_doc, cookies)
+                if texto:
+                    break
+            if not texto:
+                texto = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html)).strip()
+
+        try:
+            driver.close()
+        except Exception:
+            pass
+        driver.switch_to.window(ventana_original)
+    else:
+        # No se abrio pestaña: probablemente un modal en la misma pagina
+        time.sleep(1)
+        html = driver.page_source
+        links_doc = extraer_links_documento(html, driver.current_url)
+        print(f"    [DIAG-DOC] (modal en misma pagina) links: {links_doc}")
+        for link_doc in links_doc:
+            texto = _descargar_y_extraer(link_doc, cookies)
+            if texto:
+                break
+        try:
+            from selenium.webdriver.common.keys import Keys
+            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+        except Exception:
+            pass
+
+    if not texto:
+        print("    [DIAG-DOC] no se pudo extraer texto de ningun documento")
+    return texto
 
 def obtener_compras(driver, nombre, url, par):
     print(f"\n--- {nombre} ---")
@@ -303,27 +341,26 @@ def obtener_compras(driver, nombre, url, par):
             if es_fila_formulario(texto_fila):
                 continue
 
-            # Buscar el ID de verArchivos en esta fila
+            # Buscar el elemento clickeable de verArchivos en esta fila
             id_archivo = ""
+            elem_ver_archivos = None
             elementos_onclick = fila.find_elements(By.XPATH, ".//*[@onclick]")
             for elem in elementos_onclick:
                 onclick = elem.get_attribute("onclick") or ""
                 m_id = re.search(r"verArchivos\(\'(\d+)\'\)", onclick)
                 if m_id:
                     id_archivo = m_id.group(1)
+                    elem_ver_archivos = elem
                     break
-
-            if "76672903" in texto_fila or "821/26" in texto_fila:
-                print(f"  [DIAG-FILA] fila {i}: id_archivo extraido = '{id_archivo}' "
-                      f"(elementos con onclick encontrados: {len(elementos_onclick)})")
 
             # Buscar palabras clave en el texto de la fila
             productos = detectar_productos(texto_fila)
 
-            # Si no encontro en la fila pero tiene ID, leer el documento real
-            if not productos and id_archivo:
+            # Si no encontro en la fila pero hay un icono de ver archivos,
+            # clickearlo de verdad (via Selenium) y leer lo que PAMI muestra
+            if not productos and elem_ver_archivos is not None:
                 try:
-                    texto_buscar = leer_texto_documento(id_archivo)
+                    texto_buscar = leer_documento_via_click(driver, elem_ver_archivos)
                     if texto_buscar:
                         texto_buscar = re.sub(r'\s+', ' ', texto_buscar).strip()
                         productos = detectar_productos(texto_buscar)
