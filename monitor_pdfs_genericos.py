@@ -210,11 +210,34 @@ def leer_documento_via_click(driver, elem_trigger):
                 pass
             driver.switch_to.window(ventana_original)
         else:
+            print(f"    [B] no se abrió pestaña nueva (modal o AJAX en la misma página)")
             html = driver.page_source
-            for link in extraer_links_documento(html, driver.current_url):
+            print(f"    [B] largo del HTML actual: {len(html)}")
+
+            # Diagnostico: buscar CUALQUIER link http/https en el HTML,
+            # no solo los que terminan en pdf/doc, para ver que aparece
+            # realmente despues del click
+            todos_los_links = re.findall(r'https?://[^\s"\'<>]+', html)
+            links_unicos = list(dict.fromkeys(todos_los_links))[:15]
+            print(f"    [B] primeros links http(s) encontrados en la pagina: {links_unicos}")
+
+            links_doc = extraer_links_documento(html, driver.current_url)
+            print(f"    [B] de esos, links a documento (pdf/doc): {links_doc}")
+
+            for link in links_doc:
                 texto = _descargar_y_extraer(link, cookies)
                 if texto:
                     break
+
+            if not texto:
+                # Como ultimo recurso, capturamos el texto plano visible
+                # de la pagina (puede que el modal muestre info sin link
+                # a archivo descargable, por ej. una tabla con el detalle)
+                texto_plano = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html)).strip()
+                print(f"    [B] sin link descargable, uso texto plano de la pagina: {len(texto_plano)} caracteres")
+                if len(texto_plano) > 100:
+                    texto = texto_plano
+
             try:
                 from selenium.webdriver.common.keys import Keys
                 driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
@@ -310,7 +333,9 @@ def escanear(driver, nombre, url, clicks_usados, inicio_tiempo):
                 print(f"  [B] error leyendo documento: {e}")
                 texto_doc = ""
 
+            print(f"  [B] texto obtenido: {len(texto_doc)} caracteres")
             if not texto_doc:
+                print(f"  [B] sin texto, se descarta esta fila")
                 continue
 
             texto_doc = re.sub(r'\s+', ' ', texto_doc).strip()
