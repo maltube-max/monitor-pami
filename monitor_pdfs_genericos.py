@@ -163,8 +163,12 @@ def _descargar_y_extraer(url, cookies):
         return re.sub(r'<[^>]+>', ' ', r.text)
     return ""
 
-def leer_documento_via_click(driver, elem_trigger):
-    """Clickea el icono real y lee lo que PAMI efectivamente muestra."""
+def leer_documento_via_click(driver, elem_trigger, numero="", ejercicio=""):
+    """Clickea el icono real y lee lo que PAMI efectivamente muestra.
+    Si se pasan numero/ejercicio, prioriza el link que corresponde
+    especificamente a esta compulsa (patron CAB_{numero}_{ejercicio}_...)
+    en vez de agarrar cualquier PDF de la pagina (reglamento general,
+    actas viejas, etc.)."""
     texto = ""
     ventanas_antes = driver.window_handles
     ventana_original = driver.current_window_handle
@@ -197,7 +201,9 @@ def leer_documento_via_click(driver, elem_trigger):
                 texto = _descargar_y_extraer(url_actual, cookies)
             else:
                 html = driver.page_source
-                for link in extraer_links_documento(html, url_actual):
+                links_doc = ordenar_priorizando_compulsa(
+                    extraer_links_documento(html, url_actual), numero, ejercicio)
+                for link in links_doc:
                     texto = _descargar_y_extraer(link, cookies)
                     if texto:
                         break
@@ -214,25 +220,17 @@ def leer_documento_via_click(driver, elem_trigger):
             html = driver.page_source
             print(f"    [B] largo del HTML actual: {len(html)}")
 
-            # Diagnostico: buscar CUALQUIER link http/https en el HTML,
-            # no solo los que terminan en pdf/doc, para ver que aparece
-            # realmente despues del click
-            todos_los_links = re.findall(r'https?://[^\s"\'<>]+', html)
-            links_unicos = list(dict.fromkeys(todos_los_links))[:15]
-            print(f"    [B] primeros links http(s) encontrados en la pagina: {links_unicos}")
-
             links_doc = extraer_links_documento(html, driver.current_url)
-            print(f"    [B] de esos, links a documento (pdf/doc): {links_doc}")
+            links_doc = ordenar_priorizando_compulsa(links_doc, numero, ejercicio)
+            print(f"    [B] links a documento, ya priorizados: {links_doc}")
 
             for link in links_doc:
                 texto = _descargar_y_extraer(link, cookies)
                 if texto:
+                    print(f"    [B] usando link: {link}")
                     break
 
             if not texto:
-                # Como ultimo recurso, capturamos el texto plano visible
-                # de la pagina (puede que el modal muestre info sin link
-                # a archivo descargable, por ej. una tabla con el detalle)
                 texto_plano = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html)).strip()
                 print(f"    [B] sin link descargable, uso texto plano de la pagina: {len(texto_plano)} caracteres")
                 if len(texto_plano) > 100:
@@ -253,6 +251,24 @@ def leer_documento_via_click(driver, elem_trigger):
             pass
 
     return texto
+
+def ordenar_priorizando_compulsa(links, numero, ejercicio):
+    """Pone primero los links que contienen el patron CAB_{numero}_{ejercicio}
+    (el pliego especifico de esta compulsa), y descarta los que son
+    claramente genericos (reglamento, marco regulatorio)."""
+    if not links:
+        return links
+    prioritarios = []
+    resto = []
+    for link in links:
+        low = link.lower()
+        if "reglamento" in low or "marco_regulatorio" in low or "anexos-r-" in low:
+            continue  # nunca sirven, son documentos generales de PAMI
+        if numero and ejercicio and f"cab_{numero}_{ejercicio}" in low.replace("-", "_"):
+            prioritarios.append(link)
+        else:
+            resto.append(link)
+    return prioritarios + resto
 
 def cargar_tabla(driver, url):
     driver.get(url)
@@ -324,11 +340,21 @@ def escanear(driver, nombre, url, clicks_usados, inicio_tiempo):
             if elem_ver_archivos is None:
                 continue
 
+            # Extraemos numero/ejercicio ANTES de leer el documento, para
+            # poder priorizar el link que corresponde a ESTA compulsa
+            # puntual (patron CAB_{numero}_{ejercicio}_...) en vez de
+            # agarrar cualquier PDF que aparezca en la pagina.
+            nro_previo, ejercicio_previo = "", ""
+            m = re.search(r'(\d+)/(\d+)', texto_fila)
+            if m:
+                nro_previo = m.group(1)
+                ejercicio_previo = "20" + m.group(2) if len(m.group(2)) == 2 else m.group(2)
+
             clicks_usados[0] += 1
             print(f"  [B] [{clicks_usados[0]}/{MAX_CLICKS}] Leyendo doc fila {i}: {texto_fila[:100]}")
 
             try:
-                texto_doc = leer_documento_via_click(driver, elem_ver_archivos)
+                texto_doc = leer_documento_via_click(driver, elem_ver_archivos, nro_previo, ejercicio_previo)
             except Exception as e:
                 print(f"  [B] error leyendo documento: {e}")
                 texto_doc = ""
