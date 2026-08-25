@@ -30,11 +30,10 @@ PALABRAS_CLAVE = {
     "Clip Mitral":                 ["clip mitral", "mitraclip", "mitra clip", "clips mitrales", "reparacion valvular mitral", "reparacion percutanea valvular mitral", "reparacion mitral", "jensclip", "cierre borde a borde"],
     "Lux Valve":                   ["lux valve", "lux value"],
     "Válvula Tricuspídea":         ["tricuspide", "tricuspidea", "valvula tricuspide"],
-    "Protector Cerebral Sentinel": ["sentinel", "protector cerebral", "filtro proteccion embolica", "filtro embolica", "filtro embolico", "proteccion embolica", "protección embólica", "filtro de proteccion", "sistema de proteccion cerebral", "proteccion cerebral bicarotideo", "sistema proteccion cerebral", "proteccion cerebral"],
+    "Protector Cerebral Sentinel": ["sentinel", "protector cerebral", "filtro proteccion embolica", "filtro embolica", "filtro embolico", "proteccion embolica", "protección embólica", "filtro de proteccion", "sistema de proteccion cerebral", "proteccion cerebral bicarotideo", "sistema proteccion cerebral", "proteccion cerebral", "filtro de proteccion cerebral", "filtro proteccion cerebral"],
     "Bioadaptador":                ["bioadaptador", "bio adaptador"],
     "Ken Valve":                   ["ken valve"],
     "Cierre Percutáneo":           ["manta", "proglide", "prostar", "obtura", "clothoid", "cierre percutaneo", "dispositivo de cierre percutaneo", "dispositivo de cierre vascular", "cierre vascular"],
-
 }
 
 IGNORAR_SI_CONTIENE = [
@@ -43,14 +42,21 @@ IGNORAR_SI_CONTIENE = [
     "licitación publica", "contratación directa", "descripción\nfecha"
 ]
 
-# Patrones de endpoint donde PAMI puede publicar la pagina de "ver archivos"
-# de una compulsa. Se prueban en orden hasta que uno responda 200.
-PLANTILLAS_VER_ARCHIVOS = [
-    "https://prestadores.pami.org.ar/compras_ver_archivos.php?id={id}",
-    "https://prestadores.pami.org.ar/compras_ver_archivo.php?id={id}",
-    "https://prestadores.pami.org.ar/ver_archivos.php?id={id}",
-    "https://prestadores.pami.org.ar/compras_archivos.php?id={id}",
+# Frases que indican que la descripcion de la fila es generica y por lo
+# tanto conviene abrir el documento real para ver de que se trata.
+# Si la fila no matchea ninguna palabra clave Y ademas contiene una de
+# estas frases, se intenta leer el PDF (con tope de clicks, ver abajo).
+PATRONES_GENERICOS = [
+    "cirugia intervencionista", "cirugía intervencionista",
+    "adquisicion de insumos", "adquisición de insumos",
+    "compra menor", "dispositivo para", "prestacion de servicio",
+    "prestación de servicio", "insumos de cardiologia", "insumos de cardiología",
 ]
+
+# Tope duro de clicks por buscador (UGL / Nivel Central) para que la
+# corrida nunca se descontrole en tiempo. Se prueba SOLO en filas sin
+# keyword que ademas tengan descripcion generica (ver PATRONES_GENERICOS).
+MAX_CLICKS_POR_BUSCADOR = 20
 
 HEADERS_HTTP = {"User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"}
 
@@ -77,6 +83,10 @@ def detectar_productos(texto):
                 break
     return encontrados
 
+def es_descripcion_generica(texto):
+    texto_norm = normalizar(texto)
+    return any(normalizar(p) in texto_norm for p in PATRONES_GENERICOS)
+
 def iniciar_browser():
     opciones = Options()
     opciones.add_argument("--headless")
@@ -92,7 +102,6 @@ def iniciar_browser():
     return webdriver.Chrome(service=service, options=opciones)
 
 def obtener_url_desde_onclick(onclick_str):
-    """Extrae la URL de un string onclick de PAMI."""
     if not onclick_str:
         return ""
     patrones = [
@@ -111,26 +120,15 @@ def obtener_url_desde_onclick(onclick_str):
     return ""
 
 def extraer_links_documento(html, base_url):
-    """
-    Busca links a documentos (pdf/doc/docx) dentro de una pagina HTML.
-    - Acepta http Y https (bug anterior: solo aceptaba https).
-    - Acepta el dominio institucional.pami.org.ar y prestadores.pami.org.ar.
-    - Tambien resuelve links relativos usando base_url.
-    """
     links = set()
-
-    # 1) Links absolutos con dominio conocido de PAMI, http o https, terminados en pdf/doc/docx
     for m in re.finditer(
         r'https?://(?:institucional|prestadores|www)[.]pami[.]org[.]ar[^\s"\'<>]*\.(?:pdf|docx?|PDF|DOCX?)',
         html
     ):
         links.add(m.group(0))
-
-    # 2) Cualquier href/src que termine en esas extensiones, aunque sea de otro host
     for m in re.finditer(r'(?:href|src)\s*=\s*["\']([^"\']+\.(?:pdf|docx?|PDF|DOCX?))["\']', html):
         url = m.group(1)
         if not url.startswith("http"):
-            # resolver relativo contra el dominio base
             if url.startswith("//"):
                 url = "https:" + url
             elif url.startswith("/"):
@@ -138,19 +136,15 @@ def extraer_links_documento(html, base_url):
             else:
                 url = base_url.rsplit("/", 1)[0] + "/" + url
         links.add(url)
-
     return list(links)
 
 def _descargar_y_extraer(url, cookies):
-    """Descarga un link (pdf/doc/html) con las cookies de la sesion del
-    browser y devuelve el texto extraido, o "" si falla."""
     try:
         r = requests.get(url, cookies=cookies, timeout=20, headers=HEADERS_HTTP)
     except Exception as e:
-        print(f"    [DIAG-DOC] error request {url}: {e}")
+        print(f"    [doc] error request {url}: {e}")
         return ""
     if r.status_code != 200:
-        print(f"    [DIAG-DOC] {url} -> status {r.status_code}")
         return ""
     ct = r.headers.get("Content-Type", "").lower()
     contenido = r.content
@@ -158,29 +152,27 @@ def _descargar_y_extraer(url, cookies):
         try:
             from pdfminer.high_level import extract_text as pdf_extract
             texto = pdf_extract(io.BytesIO(contenido))
-            print(f"    [DIAG-DOC] PDF ok ({url}): {len(texto)} caracteres")
+            print(f"    [doc] PDF leido ({url}): {len(texto)} caracteres")
             return texto
         except Exception as e:
-            print(f"    [DIAG-DOC] fallo pdfminer en {url}: {e}")
+            print(f"    [doc] fallo pdfminer: {e}")
             return ""
     if "word" in ct or url.lower().endswith((".doc", ".docx")):
         try:
             import docx
             doc = docx.Document(io.BytesIO(contenido))
             return "\n".join(p.text for p in doc.paragraphs)
-        except Exception as e:
-            print(f"    [DIAG-DOC] fallo docx en {url}: {e}")
+        except Exception:
             return ""
     if len(contenido) > 500:
         return re.sub(r'<[^>]+>', ' ', r.text)
     return ""
 
-def leer_documento_via_click(driver, elem_trigger, timeout=10):
+def leer_documento_via_click(driver, elem_trigger, timeout=8):
     """
-    En vez de adivinar la URL del endpoint (demostrado que falla: 100% 404
-    en todas las variantes probadas), usamos el propio browser autenticado
-    para hacer click en el icono real (ojo/descripcion) y ver que abre PAMI
-    de verdad: pestaña nueva o un modal en la misma pagina.
+    Clickea el icono real (via el browser autenticado) y lee lo que PAMI
+    efectivamente muestra, en vez de adivinar la URL del endpoint.
+    Tiene timeouts cortos en cada paso para no colgar la corrida.
     """
     texto = ""
     ventanas_antes = driver.window_handles
@@ -190,65 +182,70 @@ def leer_documento_via_click(driver, elem_trigger, timeout=10):
         driver.execute_script("arguments[0].scrollIntoView(true);", elem_trigger)
         driver.execute_script("arguments[0].click();", elem_trigger)
     except Exception as e:
-        print(f"    [DIAG-DOC] error al clickear elemento: {e}")
+        print(f"    [doc] error al clickear: {e}")
         return ""
 
-    time.sleep(2)
+    time.sleep(1.5)
     ventanas_despues = driver.window_handles
     cookies = {c['name']: c['value'] for c in driver.get_cookies()}
 
-    if len(ventanas_despues) > len(ventanas_antes):
-        nueva = [w for w in ventanas_despues if w not in ventanas_antes][0]
-        driver.switch_to.window(nueva)
-        try:
-            WebDriverWait(driver, timeout).until(
-                lambda d: d.execute_script("return document.readyState") == "complete")
-        except Exception:
-            pass
-        url_actual = driver.current_url
-        print(f"    [DIAG-DOC] pestaña nueva: {url_actual}")
+    try:
+        if len(ventanas_despues) > len(ventanas_antes):
+            nueva = [w for w in ventanas_despues if w not in ventanas_antes][0]
+            driver.switch_to.window(nueva)
+            try:
+                WebDriverWait(driver, timeout).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete")
+            except Exception:
+                pass
+            url_actual = driver.current_url
+            print(f"    [doc] pestaña nueva: {url_actual}")
 
-        if url_actual.lower().endswith(".pdf") or "pdf" in url_actual.lower():
-            texto = _descargar_y_extraer(url_actual, cookies)
+            if ".pdf" in url_actual.lower():
+                texto = _descargar_y_extraer(url_actual, cookies)
+            else:
+                html = driver.page_source
+                links_doc = extraer_links_documento(html, url_actual)
+                for link_doc in links_doc:
+                    texto = _descargar_y_extraer(link_doc, cookies)
+                    if texto:
+                        break
+                if not texto:
+                    texto = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html)).strip()
+
+            try:
+                driver.close()
+            except Exception:
+                pass
+            driver.switch_to.window(ventana_original)
         else:
+            time.sleep(0.5)
             html = driver.page_source
-            links_doc = extraer_links_documento(html, url_actual)
-            print(f"    [DIAG-DOC] links en pestaña nueva: {links_doc}")
+            links_doc = extraer_links_documento(html, driver.current_url)
             for link_doc in links_doc:
                 texto = _descargar_y_extraer(link_doc, cookies)
                 if texto:
                     break
-            if not texto:
-                texto = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html)).strip()
-
+            try:
+                from selenium.webdriver.common.keys import Keys
+                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"    [doc] error inesperado, se continua sin este documento: {e}")
         try:
-            driver.close()
-        except Exception:
-            pass
-        driver.switch_to.window(ventana_original)
-    else:
-        # No se abrio pestaña: probablemente un modal en la misma pagina
-        time.sleep(1)
-        html = driver.page_source
-        links_doc = extraer_links_documento(html, driver.current_url)
-        print(f"    [DIAG-DOC] (modal en misma pagina) links: {links_doc}")
-        for link_doc in links_doc:
-            texto = _descargar_y_extraer(link_doc, cookies)
-            if texto:
-                break
-        try:
-            from selenium.webdriver.common.keys import Keys
-            driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
+            if driver.current_window_handle != ventana_original:
+                driver.close()
+                driver.switch_to.window(ventana_original)
         except Exception:
             pass
 
-    if not texto:
-        print("    [DIAG-DOC] no se pudo extraer texto de ningun documento")
     return texto
 
 def obtener_compras(driver, nombre, url, par):
     print(f"\n--- {nombre} ---")
     resultados = []
+    clicks_usados = 0
 
     try:
         driver.get(url)
@@ -278,61 +275,10 @@ def obtener_compras(driver, nombre, url, par):
             )
         except:
             pass
-
-        # Espera dinamica: la tabla de PAMI carga por AJAX y el numero de
-        # filas puede variar mucho segun cuanto tarde en terminar de cargar.
-        # En vez de un sleep fijo, esperamos hasta que el conteo de filas
-        # se estabilice (no crezca) durante varias verificaciones seguidas.
-        estable_desde = 0
-        anterior = -1
-        intentos = 0
-        max_intentos = 40  # hasta ~80s de espera total
-        while intentos < max_intentos:
-            actual = len(driver.find_elements(By.TAG_NAME, "tr"))
-            if actual == anterior and actual > 0:
-                estable_desde += 1
-            else:
-                estable_desde = 0
-            anterior = actual
-            if estable_desde >= 4:  # 4 chequeos seguidos sin cambios = estable
-                break
-            time.sleep(2)
-            intentos += 1
-
-        # Intentar cargar mas filas si hay paginacion / boton "cargar mas"
-        for _ in range(10):
-            try:
-                boton_mas = driver.find_element(By.XPATH,
-                    "//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'siguiente')] | "
-                    "//button[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'cargar mas')] | "
-                    "//a[contains(translate(text(),'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'cargar mas')]"
-                )
-                if boton_mas.is_displayed():
-                    driver.execute_script("arguments[0].click();", boton_mas)
-                    time.sleep(3)
-                else:
-                    break
-            except Exception:
-                break
+        time.sleep(5)
 
         filas = driver.find_elements(By.TAG_NAME, "tr")
         print(f"  Total filas: {len(filas)}")
-
-        # --- DIAGNOSTICO TEMPORAL ---
-        # Busca si el numero de compulsa o expediente puntual aparece en
-        # CUALQUIER fila leida, sin importar si matchea keywords o no.
-        # Esto permite distinguir "no llegamos a leer esa fila" de
-        # "la leimos pero algo la filtro".
-        ids_diagnostico = ["821/26", "76672903", "521142"]
-        for i, fila in enumerate(filas):
-            try:
-                txt = fila.text.strip()
-            except Exception:
-                continue
-            for id_diag in ids_diagnostico:
-                if id_diag in txt:
-                    print(f"  🔎 DIAGNOSTICO: fila {i} contiene '{id_diag}': {txt[:250]}")
-        # --- FIN DIAGNOSTICO ---
 
         for i, fila in enumerate(filas):
             texto_fila = fila.text.strip()
@@ -341,41 +287,43 @@ def obtener_compras(driver, nombre, url, par):
             if es_fila_formulario(texto_fila):
                 continue
 
-            # Buscar el elemento clickeable de verArchivos en esta fila
-            id_archivo = ""
-            elem_ver_archivos = None
-            elementos_onclick = fila.find_elements(By.XPATH, ".//*[@onclick]")
-            for elem in elementos_onclick:
-                onclick = elem.get_attribute("onclick") or ""
-                m_id = re.search(r"verArchivos\(\'(\d+)\'\)", onclick)
-                if m_id:
-                    id_archivo = m_id.group(1)
-                    elem_ver_archivos = elem
-                    break
-
-            # Buscar palabras clave en el texto de la fila
             productos = detectar_productos(texto_fila)
 
-            # Si no encontro en la fila pero hay un icono de ver archivos,
-            # clickearlo de verdad (via Selenium) y leer lo que PAMI muestra
-            if not productos and elem_ver_archivos is not None:
+            # Solo intentamos leer el documento si:
+            # 1) no matcheo por texto de la fila
+            # 2) la descripcion es "generica" (podria esconder cualquier producto)
+            # 3) todavia no llegamos al tope de clicks para este buscador
+            if not productos and es_descripcion_generica(texto_fila) and clicks_usados < MAX_CLICKS_POR_BUSCADOR:
+                elem_ver_archivos = None
                 try:
-                    texto_buscar = leer_documento_via_click(driver, elem_ver_archivos)
-                    if texto_buscar:
-                        texto_buscar = re.sub(r'\s+', ' ', texto_buscar).strip()
-                        productos = detectar_productos(texto_buscar)
-                        if productos:
-                            print(f"  Encontrado en documento {id_archivo}: {', '.join(productos)}")
-                            texto_fila = texto_fila + " " + texto_buscar[:500]
-                except Exception as e:
-                    print(f"  Error leyendo doc {id_archivo}: {e}")
+                    elementos_onclick = fila.find_elements(By.XPATH, ".//*[@onclick]")
+                    for elem in elementos_onclick:
+                        onclick = elem.get_attribute("onclick") or ""
+                        if "verArchivos" in onclick:
+                            elem_ver_archivos = elem
+                            break
+                except Exception:
+                    elem_ver_archivos = None
+
+                if elem_ver_archivos is not None:
+                    clicks_usados += 1
+                    print(f"  [{clicks_usados}/{MAX_CLICKS_POR_BUSCADOR}] Leyendo documento de fila genérica {i}: {texto_fila[:100]}")
+                    try:
+                        texto_buscar = leer_documento_via_click(driver, elem_ver_archivos)
+                        if texto_buscar:
+                            texto_buscar = re.sub(r'\s+', ' ', texto_buscar).strip()
+                            productos = detectar_productos(texto_buscar)
+                            if productos:
+                                print(f"  ✅ Encontrado en documento: {', '.join(productos)}")
+                                texto_fila = texto_fila + " " + texto_buscar[:500]
+                    except Exception as e:
+                        print(f"  Error leyendo documento fila {i}: {e}")
 
             if not productos:
                 continue
 
             print(f"\n  ✅ MATCH fila {i}: {texto_fila[:200]}")
 
-            # Extraer info
             nro = ""
             ejercicio = ""
             expediente = ""
@@ -408,40 +356,36 @@ def obtener_compras(driver, nombre, url, par):
             link_doc = ""
             pdf_bytes = None
 
-            elementos_clickeables = fila.find_elements(By.XPATH,
-                ".//*[@onclick] | .//a[@href] | .//i | .//span[@class] | .//button"
-            )
+            try:
+                elementos_clickeables = fila.find_elements(By.XPATH,
+                    ".//*[@onclick] | .//a[@href] | .//i | .//span[@class] | .//button"
+                )
+                for elem in elementos_clickeables:
+                    clase = elem.get_attribute("class") or ""
+                    onclick = elem.get_attribute("onclick") or ""
+                    href = elem.get_attribute("href") or ""
+                    texto_elem = elem.text.strip()
 
-            for elem in elementos_clickeables:
-                tag = elem.tag_name
-                clase = elem.get_attribute("class") or ""
-                onclick = elem.get_attribute("onclick") or ""
-                href = elem.get_attribute("href") or ""
-                texto_elem = elem.text.strip()
+                    if any(x in clase.lower() for x in ["eye", "ver", "visibility", "remove_red"]) or \
+                       any(x in texto_elem.lower() for x in ["remove_red_eye", "visibility"]) or \
+                       "remove_red_eye" in onclick:
+                        url_ojo = obtener_url_desde_onclick(onclick) or href
+                        if url_ojo:
+                            link_ojo = url_ojo
 
-                print(f"    Elem: tag={tag} class={clase} text={texto_elem} onclick={onclick[:100]} href={href[:100]}")
+                    if any(x in clase.lower() for x in ["description", "doc", "file", "pdf"]) or \
+                       any(x in texto_elem.lower() for x in ["description"]) or \
+                       "description" in onclick:
+                        url_doc = obtener_url_desde_onclick(onclick) or href
+                        if url_doc:
+                            link_doc = url_doc
 
-                if any(x in clase.lower() for x in ["eye", "ver", "visibility", "remove_red"]) or \
-                   any(x in texto_elem.lower() for x in ["remove_red_eye", "visibility"]) or \
-                   "remove_red_eye" in onclick:
-                    url_ojo = obtener_url_desde_onclick(onclick) or href
-                    if url_ojo:
-                        link_ojo = url_ojo
-                        print(f"    ✅ Link ojo: {link_ojo}")
-
-                if any(x in clase.lower() for x in ["description", "doc", "file", "pdf"]) or \
-                   any(x in texto_elem.lower() for x in ["description"]) or \
-                   "description" in onclick:
-                    url_doc = obtener_url_desde_onclick(onclick) or href
-                    if url_doc:
-                        link_doc = url_doc
-                        print(f"    ✅ Link doc: {link_doc}")
-
-                if onclick and not link_ojo:
-                    url_onclick = obtener_url_desde_onclick(onclick)
-                    if url_onclick and "result.php" not in url_onclick:
-                        link_ojo = url_onclick
-                        print(f"    ✅ Link onclick genérico: {link_ojo}")
+                    if onclick and not link_ojo:
+                        url_onclick = obtener_url_desde_onclick(onclick)
+                        if url_onclick and "result.php" not in url_onclick:
+                            link_ojo = url_onclick
+            except Exception:
+                pass
 
             link_final = link_ojo or link_doc
 
@@ -452,25 +396,11 @@ def obtener_compras(driver, nombre, url, par):
                         ct = r.headers.get("Content-Type", "")
                         if "pdf" in ct.lower() or "word" in ct.lower() or "octet" in ct.lower() or len(r.content) > 10000:
                             pdf_bytes = r.content
-                            print(f"  ✅ Archivo descargado: {len(pdf_bytes)} bytes, tipo: {ct}")
                 except Exception as e:
                     print(f"  Error descargando: {e}")
 
-            if not link_final and id_archivo:
-                # Fallback: si no hay link_ojo/link_doc, apuntar directo a la pagina
-                # de ver archivos (la primera plantilla que respondio 200)
-                for plantilla in PLANTILLAS_VER_ARCHIVOS:
-                    posible = plantilla.format(id=id_archivo)
-                    try:
-                        rr = requests.head(posible, timeout=10, headers=HEADERS_HTTP)
-                        if rr.status_code == 200:
-                            link_final = posible
-                            break
-                    except Exception:
-                        continue
-
             if not link_final:
-                link_final = url  # fallback al buscador
+                link_final = url
 
             resultados.append({
                 "desc":      desc,
@@ -491,6 +421,7 @@ def obtener_compras(driver, nombre, url, par):
     except Exception as e:
         print(f"  Error general: {e}")
 
+    print(f"  Clicks de lectura de documentos usados: {clicks_usados}/{MAX_CLICKS_POR_BUSCADOR}")
     return resultados
 
 def main():
