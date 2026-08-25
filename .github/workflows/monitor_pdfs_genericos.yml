@@ -1,0 +1,44 @@
+name: Monitor PAMI - Documentos Genericos (Proceso B)
+
+# IMPORTANTE: este workflow es independiente del que corre monitor.py
+# a diario. No lo modifica, no lo reemplaza, no comparte pasos con el.
+#
+# Arranca en modo MANUAL (workflow_dispatch) a proposito, para que se
+# pueda probar varias veces sin riesgo antes de dejarlo en piloto
+# automatico. Cuando este validado, se puede agregar un "schedule:"
+# propio (con su propio horario) o un segundo cron-job.org apuntando
+# a este workflow puntual.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  revisar_documentos_genericos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20   # limite duro a nivel de Github Actions: si por
+                           # cualquier motivo el script no corta solo, el
+                           # workflow entero se cancela aca. Esto NO
+                           # afecta al workflow del Proceso A.
+    steps:
+      - name: Descargar codigo
+        uses: actions/checkout@v4
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Instalar Chrome y dependencias
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget unzip
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list'
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+          pip install selenium webdriver-manager requests pdfminer.six python-docx
+
+      - name: Ejecutar Proceso B
+        env:
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+        run: python monitor_pdfs_genericos.py
