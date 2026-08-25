@@ -147,21 +147,27 @@ def leer_texto_documento(id_archivo):
     varias plantillas de endpoint, y si encuentra un link a documento,
     lo descarga y extrae el texto (pdf/doc/docx). Devuelve el texto o "".
     """
+    print(f"    [DIAG-DOC] Intentando leer documento id={id_archivo}")
     for plantilla in PLANTILLAS_VER_ARCHIVOS:
         url_archivos = plantilla.format(id=id_archivo)
         try:
             r_archivos = requests.get(url_archivos, timeout=15, headers=HEADERS_HTTP)
-        except Exception:
+        except Exception as e:
+            print(f"    [DIAG-DOC] {url_archivos} -> ERROR request: {e}")
             continue
+        print(f"    [DIAG-DOC] {url_archivos} -> status {r_archivos.status_code}, len={len(r_archivos.text)}")
         if r_archivos.status_code != 200:
             continue
 
         html_archivos = r_archivos.text
         links_doc = extraer_links_documento(html_archivos, url_archivos)
+        print(f"    [DIAG-DOC] links de documento encontrados: {links_doc}")
 
         for link_doc in links_doc:
             try:
                 r_doc = requests.get(link_doc, timeout=20, headers=HEADERS_HTTP)
+                print(f"    [DIAG-DOC] descarga {link_doc} -> status {r_doc.status_code}, "
+                      f"content-type={r_doc.headers.get('Content-Type','')}, bytes={len(r_doc.content)}")
                 if r_doc.status_code != 200:
                     continue
                 ct = r_doc.headers.get("Content-Type", "").lower()
@@ -170,8 +176,11 @@ def leer_texto_documento(id_archivo):
                 if "pdf" in ct or link_doc.lower().endswith(".pdf"):
                     try:
                         from pdfminer.high_level import extract_text as pdf_extract
-                        return pdf_extract(io.BytesIO(contenido))
-                    except Exception:
+                        texto = pdf_extract(io.BytesIO(contenido))
+                        print(f"    [DIAG-DOC] texto extraido de PDF: {len(texto)} caracteres")
+                        return texto
+                    except Exception as e:
+                        print(f"    [DIAG-DOC] fallo pdfminer: {e}")
                         return contenido.decode("latin-1", errors="ignore")
 
                 if "word" in ct or link_doc.lower().endswith((".doc", ".docx")):
@@ -179,23 +188,24 @@ def leer_texto_documento(id_archivo):
                         import docx
                         doc = docx.Document(io.BytesIO(contenido))
                         return "\n".join(p.text for p in doc.paragraphs)
-                    except Exception:
+                    except Exception as e:
+                        print(f"    [DIAG-DOC] fallo lectura docx: {e}")
                         return contenido.decode("latin-1", errors="ignore")
 
-                # Contenido desconocido pero descargable: lo devolvemos como texto plano
                 if len(contenido) > 500:
                     return re.sub(r'<[^>]+>', ' ', r_doc.text)
-            except Exception:
+            except Exception as e:
+                print(f"    [DIAG-DOC] error descargando {link_doc}: {e}")
                 continue
 
-        # No encontramos un documento descargable: al menos devolvemos el
-        # texto plano de la pagina de "ver archivos" (puede tener el detalle)
         if not links_doc:
             texto_plano = re.sub(r'<[^>]+>', ' ', html_archivos)
             texto_plano = re.sub(r'\s+', ' ', texto_plano).strip()
+            print(f"    [DIAG-DOC] sin links de documento, texto plano de la pagina: {len(texto_plano)} caracteres")
             if len(texto_plano) > 50:
                 return texto_plano
 
+    print(f"    [DIAG-DOC] no se pudo leer ningun documento para id={id_archivo}")
     return ""
 
 def obtener_compras(driver, nombre, url, par):
@@ -302,6 +312,10 @@ def obtener_compras(driver, nombre, url, par):
                 if m_id:
                     id_archivo = m_id.group(1)
                     break
+
+            if "76672903" in texto_fila or "821/26" in texto_fila:
+                print(f"  [DIAG-FILA] fila {i}: id_archivo extraido = '{id_archivo}' "
+                      f"(elementos con onclick encontrados: {len(elementos_onclick)})")
 
             # Buscar palabras clave en el texto de la fila
             productos = detectar_productos(texto_fila)
