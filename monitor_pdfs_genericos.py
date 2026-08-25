@@ -92,25 +92,22 @@ def es_fila_formulario(texto):
     texto_norm = normalizar(texto)
     return any(normalizar(x) in texto_norm for x in IGNORAR_SI_CONTIENE)
 
-def unir_letras_sueltas(texto):
-    """Arregla un problema comun de pdfminer: en algunas tablas/fuentes,
-    el texto se extrae con las letras separadas por espacios
-    (ej. 'S E N T I N E L' en vez de 'SENTINEL'), lo que hace que la
-    busqueda de palabras clave nunca encuentre nada aunque el texto
-    este ahi. Esto une esas letras sueltas antes de buscar."""
-    return re.sub(
-        r'\b(?:[A-Za-zÁÉÍÓÚÑáéíóúñ] ){2,}[A-Za-zÁÉÍÓÚÑáéíóúñ]\b',
-        lambda m: m.group(0).replace(' ', ''),
-        texto
-    )
+def compactar(texto):
+    """Elimina TODOS los espacios en blanco (espacios, tabs, saltos de
+    linea), sin importar el patron de corrupcion que haya metido
+    pdfminer al extraer texto de tablas. Mucho mas robusto que intentar
+    adivinar un patron especifico de espaciado."""
+    return re.sub(r'\s+', '', texto)
 
 def detectar_productos(texto):
-    texto = unir_letras_sueltas(texto)
     texto_norm = normalizar(texto)
+    texto_compacto = compactar(texto_norm)
     encontrados = []
     for producto, variantes in PALABRAS_CLAVE.items():
         for v in variantes:
-            if normalizar(v) in texto_norm:
+            v_norm = normalizar(v)
+            v_compacto = compactar(v_norm)
+            if v_norm in texto_norm or v_compacto in texto_compacto:
                 encontrados.append(producto)
                 break
     return encontrados
@@ -380,6 +377,11 @@ def escanear(driver, nombre, url, clicks_usados, inicio_tiempo):
             texto_doc = re.sub(r'\s+', ' ', texto_doc).strip()
             productos = detectar_productos(texto_doc)
             if not productos:
+                # Red de seguridad: mostramos un fragmento real del texto
+                # para poder diagnosticar con datos reales si esto vuelve
+                # a fallar, en vez de seguir adivinando el patron.
+                print(f"  [B] No matcheo. Muestra del texto extraido (primeros 800 caracteres):")
+                print(f"  [B] {texto_doc[:800]}")
                 continue
 
             print(f"  [B] ✅ ENCONTRADO: {', '.join(productos)}")
