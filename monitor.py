@@ -30,10 +30,11 @@ PALABRAS_CLAVE = {
     "Clip Mitral":                 ["clip mitral", "mitraclip", "mitra clip", "clips mitrales", "reparacion valvular mitral", "reparacion percutanea valvular mitral", "reparacion mitral", "jensclip", "cierre borde a borde"],
     "Lux Valve":                   ["lux valve", "lux value"],
     "Válvula Tricuspídea":         ["tricuspide", "tricuspidea", "valvula tricuspide"],
-    "Protector Cerebral Sentinel": ["sentinel", "protector cerebral", "filtro proteccion embolica", "filtro embolica", "filtro embolico", "proteccion embolica", "protección embólica", "filtro de proteccion", "sistema de proteccion cerebral", "proteccion cerebral bicarotideo", "sistema proteccion cerebral", "proteccion cerebral", "filtro de proteccion cerebral", "filtro proteccion cerebral"],
+    "Protector Cerebral Sentinel": ["sentinel", "protector cerebral", "filtro proteccion embolica", "filtro embolica", "filtro embolico", "proteccion embolica", "protección embólica", "filtro de proteccion", "sistema de proteccion cerebral", "proteccion cerebral bicarotideo", "sistema proteccion cerebral", "proteccion cerebral"],
     "Bioadaptador":                ["bioadaptador", "bio adaptador"],
     "Ken Valve":                   ["ken valve"],
     "Cierre Percutáneo":           ["manta", "proglide", "prostar", "obtura", "clothoid", "cierre percutaneo", "dispositivo de cierre percutaneo", "dispositivo de cierre vascular", "cierre vascular"],
+
 }
 
 IGNORAR_SI_CONTIENE = [
@@ -41,24 +42,6 @@ IGNORAR_SI_CONTIENE = [
     "aplicación de legislación", "compras menores", "concurso abreviado",
     "licitación publica", "contratación directa", "descripción\nfecha"
 ]
-
-# Frases que indican que la descripcion de la fila es generica y por lo
-# tanto conviene abrir el documento real para ver de que se trata.
-# Si la fila no matchea ninguna palabra clave Y ademas contiene una de
-# estas frases, se intenta leer el PDF (con tope de clicks, ver abajo).
-PATRONES_GENERICOS = [
-    "cirugia intervencionista", "cirugía intervencionista",
-    "adquisicion de insumos", "adquisición de insumos",
-    "compra menor", "dispositivo para", "prestacion de servicio",
-    "prestación de servicio", "insumos de cardiologia", "insumos de cardiología",
-]
-
-# Tope duro de clicks por buscador (UGL / Nivel Central) para que la
-# corrida nunca se descontrole en tiempo. Se prueba SOLO en filas sin
-# keyword que ademas tengan descripcion generica (ver PATRONES_GENERICOS).
-MAX_CLICKS_POR_BUSCADOR = 20
-
-HEADERS_HTTP = {"User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"}
 
 def normalizar(texto):
     texto = texto.lower()
@@ -83,10 +66,6 @@ def detectar_productos(texto):
                 break
     return encontrados
 
-def es_descripcion_generica(texto):
-    texto_norm = normalizar(texto)
-    return any(normalizar(p) in texto_norm for p in PATRONES_GENERICOS)
-
 def iniciar_browser():
     opciones = Options()
     opciones.add_argument("--headless")
@@ -94,6 +73,7 @@ def iniciar_browser():
     opciones.add_argument("--disable-dev-shm-usage")
     opciones.add_argument("--disable-gpu")
     opciones.add_argument("--window-size=1920,1080")
+    # Configurar carpeta de descargas
     prefs = {"download.default_directory": "/tmp/pami_downloads",
              "download.prompt_for_download": False,
              "plugins.always_open_pdf_externally": True}
@@ -102,8 +82,10 @@ def iniciar_browser():
     return webdriver.Chrome(service=service, options=opciones)
 
 def obtener_url_desde_onclick(onclick_str):
+    """Extrae la URL de un string onclick de PAMI."""
     if not onclick_str:
         return ""
+    # Patrones comunes en PAMI
     patrones = [
         r"window\.open\(['\"]([^'\"]+)['\"]",
         r"location\.href\s*=\s*['\"]([^'\"]+)['\"]",
@@ -119,133 +101,9 @@ def obtener_url_desde_onclick(onclick_str):
             return url
     return ""
 
-def extraer_links_documento(html, base_url):
-    links = set()
-    for m in re.finditer(
-        r'https?://(?:institucional|prestadores|www)[.]pami[.]org[.]ar[^\s"\'<>]*\.(?:pdf|docx?|PDF|DOCX?)',
-        html
-    ):
-        links.add(m.group(0))
-    for m in re.finditer(r'(?:href|src)\s*=\s*["\']([^"\']+\.(?:pdf|docx?|PDF|DOCX?))["\']', html):
-        url = m.group(1)
-        if not url.startswith("http"):
-            if url.startswith("//"):
-                url = "https:" + url
-            elif url.startswith("/"):
-                url = "https://institucional.pami.org.ar" + url
-            else:
-                url = base_url.rsplit("/", 1)[0] + "/" + url
-        links.add(url)
-    return list(links)
-
-def _descargar_y_extraer(url, cookies):
-    try:
-        r = requests.get(url, cookies=cookies, timeout=20, headers=HEADERS_HTTP)
-    except Exception as e:
-        print(f"    [doc] error request {url}: {e}")
-        return ""
-    if r.status_code != 200:
-        return ""
-    ct = r.headers.get("Content-Type", "").lower()
-    contenido = r.content
-    if "pdf" in ct or url.lower().endswith(".pdf"):
-        try:
-            from pdfminer.high_level import extract_text as pdf_extract
-            texto = pdf_extract(io.BytesIO(contenido))
-            print(f"    [doc] PDF leido ({url}): {len(texto)} caracteres")
-            return texto
-        except Exception as e:
-            print(f"    [doc] fallo pdfminer: {e}")
-            return ""
-    if "word" in ct or url.lower().endswith((".doc", ".docx")):
-        try:
-            import docx
-            doc = docx.Document(io.BytesIO(contenido))
-            return "\n".join(p.text for p in doc.paragraphs)
-        except Exception:
-            return ""
-    if len(contenido) > 500:
-        return re.sub(r'<[^>]+>', ' ', r.text)
-    return ""
-
-def leer_documento_via_click(driver, elem_trigger, timeout=8):
-    """
-    Clickea el icono real (via el browser autenticado) y lee lo que PAMI
-    efectivamente muestra, en vez de adivinar la URL del endpoint.
-    Tiene timeouts cortos en cada paso para no colgar la corrida.
-    """
-    texto = ""
-    ventanas_antes = driver.window_handles
-    ventana_original = driver.current_window_handle
-
-    try:
-        driver.execute_script("arguments[0].scrollIntoView(true);", elem_trigger)
-        driver.execute_script("arguments[0].click();", elem_trigger)
-    except Exception as e:
-        print(f"    [doc] error al clickear: {e}")
-        return ""
-
-    time.sleep(1.5)
-    ventanas_despues = driver.window_handles
-    cookies = {c['name']: c['value'] for c in driver.get_cookies()}
-
-    try:
-        if len(ventanas_despues) > len(ventanas_antes):
-            nueva = [w for w in ventanas_despues if w not in ventanas_antes][0]
-            driver.switch_to.window(nueva)
-            try:
-                WebDriverWait(driver, timeout).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete")
-            except Exception:
-                pass
-            url_actual = driver.current_url
-            print(f"    [doc] pestaña nueva: {url_actual}")
-
-            if ".pdf" in url_actual.lower():
-                texto = _descargar_y_extraer(url_actual, cookies)
-            else:
-                html = driver.page_source
-                links_doc = extraer_links_documento(html, url_actual)
-                for link_doc in links_doc:
-                    texto = _descargar_y_extraer(link_doc, cookies)
-                    if texto:
-                        break
-                if not texto:
-                    texto = re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', html)).strip()
-
-            try:
-                driver.close()
-            except Exception:
-                pass
-            driver.switch_to.window(ventana_original)
-        else:
-            time.sleep(0.5)
-            html = driver.page_source
-            links_doc = extraer_links_documento(html, driver.current_url)
-            for link_doc in links_doc:
-                texto = _descargar_y_extraer(link_doc, cookies)
-                if texto:
-                    break
-            try:
-                from selenium.webdriver.common.keys import Keys
-                driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"    [doc] error inesperado, se continua sin este documento: {e}")
-        try:
-            if driver.current_window_handle != ventana_original:
-                driver.close()
-                driver.switch_to.window(ventana_original)
-        except Exception:
-            pass
-
-    return texto
-
 def obtener_compras(driver, nombre, url, par):
     print(f"\n--- {nombre} ---")
     resultados = []
-    clicks_usados = 0
 
     try:
         driver.get(url)
@@ -287,43 +145,71 @@ def obtener_compras(driver, nombre, url, par):
             if es_fila_formulario(texto_fila):
                 continue
 
+            # Buscar el ID de verArchivos en esta fila
+            id_archivo = ""
+            elementos_onclick = fila.find_elements(By.XPATH, ".//*[@onclick]")
+            for elem in elementos_onclick:
+                onclick = elem.get_attribute("onclick") or ""
+                m_id = re.search(r"verArchivos\(\'(\d+)\'\)", onclick)
+                if m_id:
+                    id_archivo = m_id.group(1)
+                    break
+
+            # Buscar palabras clave en el texto de la fila
             productos = detectar_productos(texto_fila)
 
-            # Solo intentamos leer el documento si:
-            # 1) no matcheo por texto de la fila
-            # 2) la descripcion es "generica" (podria esconder cualquier producto)
-            # 3) todavia no llegamos al tope de clicks para este buscador
-            if not productos and es_descripcion_generica(texto_fila) and clicks_usados < MAX_CLICKS_POR_BUSCADOR:
-                elem_ver_archivos = None
+            # Si no encontro en la fila pero tiene ID, leer el documento
+            if not productos and id_archivo:
                 try:
-                    elementos_onclick = fila.find_elements(By.XPATH, ".//*[@onclick]")
-                    for elem in elementos_onclick:
-                        onclick = elem.get_attribute("onclick") or ""
-                        if "verArchivos" in onclick:
-                            elem_ver_archivos = elem
-                            break
-                except Exception:
-                    elem_ver_archivos = None
-
-                if elem_ver_archivos is not None:
-                    clicks_usados += 1
-                    print(f"  [{clicks_usados}/{MAX_CLICKS_POR_BUSCADOR}] Leyendo documento de fila genérica {i}: {texto_fila[:100]}")
-                    try:
-                        texto_buscar = leer_documento_via_click(driver, elem_ver_archivos)
-                        if texto_buscar:
-                            texto_buscar = re.sub(r'\s+', ' ', texto_buscar).strip()
-                            productos = detectar_productos(texto_buscar)
-                            if productos:
-                                print(f"  ✅ Encontrado en documento: {', '.join(productos)}")
-                                texto_fila = texto_fila + " " + texto_buscar[:500]
-                    except Exception as e:
-                        print(f"  Error leyendo documento fila {i}: {e}")
+                    # Abrir la pagina de archivos para obtener el link real al PDF
+                    url_archivos = f"https://prestadores.pami.org.ar/compras_ver_archivos.php?id={id_archivo}"
+                    r_archivos = requests.get(url_archivos, timeout=15, headers={
+                        "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
+                    })
+                    texto_buscar = ""
+                    if r_archivos.status_code == 200:
+                        html_archivos = r_archivos.text
+                        # Buscar links a PDFs en la pagina
+                        links_pdf = re.findall(r'https://institucional[.]pami[.]org[.]ar[^\s"]*[.]pdf', html_archivos, re.IGNORECASE)
+                        for link_pdf in links_pdf:
+                            if not link_pdf.startswith("http"):
+                                link_pdf = "https://institucional.pami.org.ar/" + link_pdf.lstrip("/")
+                            try:
+                                r_pdf = requests.get(link_pdf, timeout=15, headers={
+                                    "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
+                                })
+                                if r_pdf.status_code == 200:
+                                    ct = r_pdf.headers.get("Content-Type","")
+                                    if "pdf" in ct.lower():
+                                        try:
+                                            from pdfminer.high_level import extract_text as pdf_extract
+                                            texto_buscar = pdf_extract(io.BytesIO(r_pdf.content))
+                                        except:
+                                            texto_buscar = r_pdf.content.decode("latin-1", errors="ignore")
+                                    else:
+                                        texto_buscar = re.sub(r'<[^>]+>', ' ', r_pdf.text)
+                                    break
+                            except:
+                                pass
+                        # Si no encontro PDF, buscar en el HTML de la pagina de archivos
+                        if not texto_buscar:
+                            texto_buscar = re.sub(r'<[^>]+>', ' ', html_archivos)
+                    
+                    if texto_buscar:
+                        texto_buscar = re.sub(r'\s+', ' ', texto_buscar).strip()
+                        productos = detectar_productos(texto_buscar)
+                        if productos:
+                            print(f"  Encontrado en documento {id_archivo}: {', '.join(productos)}")
+                            texto_fila = texto_fila + " " + texto_buscar[:500]
+                except Exception as e:
+                    print(f"  Error leyendo doc {id_archivo}: {e}")
 
             if not productos:
                 continue
 
             print(f"\n  ✅ MATCH fila {i}: {texto_fila[:200]}")
 
+            # Extraer info
             nro = ""
             ejercicio = ""
             expediente = ""
@@ -352,55 +238,71 @@ def obtener_compras(driver, nombre, url, par):
             if m:
                 desc = m.group(1).strip()[:150]
 
+            # Buscar el ícono del ojo (remove_red_eye) en la fila
+            # y obtener su URL via onclick o href
             link_ojo = ""
             link_doc = ""
             pdf_bytes = None
 
-            try:
-                elementos_clickeables = fila.find_elements(By.XPATH,
-                    ".//*[@onclick] | .//a[@href] | .//i | .//span[@class] | .//button"
-                )
-                for elem in elementos_clickeables:
-                    clase = elem.get_attribute("class") or ""
-                    onclick = elem.get_attribute("onclick") or ""
-                    href = elem.get_attribute("href") or ""
-                    texto_elem = elem.text.strip()
+            # Buscar todos los elementos clickeables en la fila
+            elementos_clickeables = fila.find_elements(By.XPATH, 
+                ".//*[@onclick] | .//a[@href] | .//i | .//span[@class] | .//button"
+            )
+            
+            for elem in elementos_clickeables:
+                tag = elem.tag_name
+                clase = elem.get_attribute("class") or ""
+                onclick = elem.get_attribute("onclick") or ""
+                href = elem.get_attribute("href") or ""
+                texto_elem = elem.text.strip()
+                
+                print(f"    Elem: tag={tag} class={clase} text={texto_elem} onclick={onclick[:100]} href={href[:100]}")
+                
+                # El ícono del ojo en Material Icons se llama "remove_red_eye" o "visibility"
+                if any(x in clase.lower() for x in ["eye", "ver", "visibility", "remove_red"]) or \
+                   any(x in texto_elem.lower() for x in ["remove_red_eye", "visibility"]) or \
+                   "remove_red_eye" in onclick:
+                    url_ojo = obtener_url_desde_onclick(onclick) or href
+                    if url_ojo:
+                        link_ojo = url_ojo
+                        print(f"    ✅ Link ojo: {link_ojo}")
 
-                    if any(x in clase.lower() for x in ["eye", "ver", "visibility", "remove_red"]) or \
-                       any(x in texto_elem.lower() for x in ["remove_red_eye", "visibility"]) or \
-                       "remove_red_eye" in onclick:
-                        url_ojo = obtener_url_desde_onclick(onclick) or href
-                        if url_ojo:
-                            link_ojo = url_ojo
+                # El ícono del documento se llama "description" en Material Icons
+                if any(x in clase.lower() for x in ["description", "doc", "file", "pdf"]) or \
+                   any(x in texto_elem.lower() for x in ["description"]) or \
+                   "description" in onclick:
+                    url_doc = obtener_url_desde_onclick(onclick) or href
+                    if url_doc:
+                        link_doc = url_doc
+                        print(f"    ✅ Link doc: {link_doc}")
 
-                    if any(x in clase.lower() for x in ["description", "doc", "file", "pdf"]) or \
-                       any(x in texto_elem.lower() for x in ["description"]) or \
-                       "description" in onclick:
-                        url_doc = obtener_url_desde_onclick(onclick) or href
-                        if url_doc:
-                            link_doc = url_doc
+                # Cualquier onclick con URL
+                if onclick and not link_ojo:
+                    url_onclick = obtener_url_desde_onclick(onclick)
+                    if url_onclick and "result.php" not in url_onclick:
+                        link_ojo = url_onclick
+                        print(f"    ✅ Link onclick genérico: {link_ojo}")
 
-                    if onclick and not link_ojo:
-                        url_onclick = obtener_url_desde_onclick(onclick)
-                        if url_onclick and "result.php" not in url_onclick:
-                            link_ojo = url_onclick
-            except Exception:
-                pass
-
+            # Usar link_ojo primero, si no link_doc
             link_final = link_ojo or link_doc
 
+            # Si encontramos un link, intentar descargar
             if link_final:
                 try:
-                    r = requests.get(link_final, timeout=20, headers=HEADERS_HTTP)
+                    r = requests.get(link_final, timeout=20, headers={
+                        "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
+                    })
                     if r.status_code == 200:
                         ct = r.headers.get("Content-Type", "")
                         if "pdf" in ct.lower() or "word" in ct.lower() or "octet" in ct.lower() or len(r.content) > 10000:
                             pdf_bytes = r.content
+                            print(f"  ✅ Archivo descargado: {len(pdf_bytes)} bytes, tipo: {ct}")
                 except Exception as e:
                     print(f"  Error descargando: {e}")
 
+            # Si no pudimos descargar, al menos guardamos el link
             if not link_final:
-                link_final = url
+                link_final = url  # fallback al buscador
 
             resultados.append({
                 "desc":      desc,
@@ -421,13 +323,13 @@ def obtener_compras(driver, nombre, url, par):
     except Exception as e:
         print(f"  Error general: {e}")
 
-    print(f"  Clicks de lectura de documentos usados: {clicks_usados}/{MAX_CLICKS_POR_BUSCADOR}")
     return resultados
 
 def main():
     fecha = datetime.now().strftime("%d/%m/%Y %H:%M")
     print(f"=== Monitor PAMI — {fecha} ===")
 
+    # Crear carpeta de descargas
     os.makedirs("/tmp/pami_downloads", exist_ok=True)
 
     driver = iniciar_browser()
@@ -446,6 +348,7 @@ def main():
     finally:
         driver.quit()
 
+    # Deduplicar
     vistos = set()
     resultados_unicos = []
     for r in resultados:
