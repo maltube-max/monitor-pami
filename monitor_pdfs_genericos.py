@@ -92,7 +92,20 @@ def es_fila_formulario(texto):
     texto_norm = normalizar(texto)
     return any(normalizar(x) in texto_norm for x in IGNORAR_SI_CONTIENE)
 
+def unir_letras_sueltas(texto):
+    """Arregla un problema comun de pdfminer: en algunas tablas/fuentes,
+    el texto se extrae con las letras separadas por espacios
+    (ej. 'S E N T I N E L' en vez de 'SENTINEL'), lo que hace que la
+    busqueda de palabras clave nunca encuentre nada aunque el texto
+    este ahi. Esto une esas letras sueltas antes de buscar."""
+    return re.sub(
+        r'\b(?:[A-Za-zÁÉÍÓÚÑáéíóúñ] ){2,}[A-Za-zÁÉÍÓÚÑáéíóúñ]\b',
+        lambda m: m.group(0).replace(' ', ''),
+        texto
+    )
+
 def detectar_productos(texto):
+    texto = unir_letras_sueltas(texto)
     texto_norm = normalizar(texto)
     encontrados = []
     for producto, variantes in PALABRAS_CLAVE.items():
