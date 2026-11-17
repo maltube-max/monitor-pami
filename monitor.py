@@ -34,6 +34,7 @@ PALABRAS_CLAVE = {
     "Bioadaptador":                ["bioadaptador", "bio adaptador"],
     "Ken Valve":                   ["ken valve"],
     "Cierre Percutáneo":           ["manta", "proglide", "prostar", "obtura", "clothoid", "cierre percutaneo", "dispositivo de cierre percutaneo", "dispositivo de cierre vascular", "cierre vascular"],
+    "Válvula Aórtica Percutánea":  ["valvula aortica percutanea", "valvula aortica"],
 
 }
 
@@ -340,22 +341,33 @@ def main():
         for nombre, url, par in URLS_BUSCADOR:
             compras = obtener_compras(driver, nombre, url, par)
             for c in compras:
-                if c["pdf_bytes"] and len(adjuntos) < 5:
-                    ext = "pdf"
-                    n = f"pliego_{c['info'].get('numero', len(adjuntos)+1)}.{ext}"
-                    adjuntos.append((n, c["pdf_bytes"]))
                 resultados.append(c)
     finally:
         driver.quit()
 
     # Deduplicar
-    vistos = set()
+    vistos = {}
     resultados_unicos = []
     for r in resultados:
-        key = r["info"].get("numero","") + r["info"].get("expediente","")
+        key = r["info"].get("numero","") + "/" + r["info"].get("ejercicio","") + r["info"].get("expediente","")
         if key not in vistos:
-            vistos.add(key)
+            vistos[key] = r
             resultados_unicos.append(r)
+        else:
+            # Misma compulsa: juntar los productos en una sola tarjeta
+            existente = vistos[key]
+            for p in r["productos"]:
+                if p not in existente["productos"]:
+                    existente["productos"].append(p)
+            if r.get("pdf_bytes") and not existente.get("pdf_bytes"):
+                existente["pdf_bytes"] = r["pdf_bytes"]
+                existente["es_pdf"] = True
+                existente["link"] = r["link"]
+
+    for c in resultados_unicos:
+        if c.get("pdf_bytes") and len(adjuntos) < 5:
+            n = f"pliego_{c['info'].get('numero', len(adjuntos)+1)}.pdf"
+            adjuntos.append((n, c["pdf_bytes"]))
 
     print(f"\n=== Total: {len(resultados_unicos)} resultado(s) ===")
 
