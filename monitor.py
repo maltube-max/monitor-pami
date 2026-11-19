@@ -27,7 +27,7 @@ URLS_BUSCADOR = [
 ]
 
 PALABRAS_CLAVE = {
-    "Clip Mitral":                 ["clip mitral", "mitraclip", "mitra clip", "clips mitrales", "reparacion valvular mitral", "reparacion percutanea valvular mitral", "reparacion mitral", "jensclip", "cierre borde a borde"],
+    "Clip Mitral":                 ["clip mitral", "mitraclip", "mitra clip", "clips mitrales", "reparacion valvular mitral", "reparacion percutanea valvular mitral", "reparacion mitral", "jensclip", "cierre borde a borde", "borde a borde", "clip de valvas", "valvas mitrales", "reparacion percutanea de la valvula mitral"],
     "Lux Valve":                   ["lux valve", "lux value"],
     "Válvula Tricuspídea":         ["tricuspide", "tricuspidea", "valvula tricuspide"],
     "Protector Cerebral Sentinel": ["sentinel", "protector cerebral", "filtro proteccion embolica", "filtro embolica", "filtro embolico", "proteccion embolica", "protección embólica", "filtro de proteccion", "sistema de proteccion cerebral", "proteccion cerebral bicarotideo", "sistema proteccion cerebral", "proteccion cerebral"],
@@ -102,6 +102,77 @@ def obtener_url_desde_onclick(onclick_str):
             return url
     return ""
 
+RUBROS_GENERICOS = ["cirugia intervencionista", "cardiologia", "hemodinamia"]
+MAX_DOCS_POR_CORRIDA = 40
+
+def extraer_texto_archivo(contenido):
+    """Devuelve el texto de un PDF o Word (docx). Vacio si no puede leerlo."""
+    try:
+        if contenido[:4] == b"%PDF":
+            from pdfminer.high_level import extract_text as pdf_extract
+            return pdf_extract(io.BytesIO(contenido))
+        if contenido[:2] == b"PK":
+            import zipfile
+            with zipfile.ZipFile(io.BytesIO(contenido)) as z:
+                xml = z.read("word/document.xml").decode("utf-8", errors="ignore")
+            return re.sub(r"<[^>]+>", " ", xml)
+    except Exception:
+        pass
+    return ""
+
+def links_de_archivos(html):
+    return set(re.findall(r'(?:href|src)=["\']([^"\']+\.(?:pdf|docx?)[^"\']*)["\']', html, re.IGNORECASE))
+
+def leer_documentos_fila(driver, id_archivo):
+    """Hace clic en el ojo de la fila (verArchivos) y lee los PDF/Word que se abran.
+    Devuelve (texto, bytes_del_primer_archivo, url_del_primer_archivo)."""
+    from urllib.parse import urljoin
+    ventana_original = driver.current_window_handle
+    ventanas_antes = set(driver.window_handles)
+    links_antes = links_de_archivos(driver.page_source)
+    urls = []
+    try:
+        driver.execute_script(f"verArchivos('{id_archivo}');")
+        time.sleep(4)
+        for h in set(driver.window_handles) - ventanas_antes:
+            driver.switch_to.window(h)
+            time.sleep(2)
+            if re.search(r"\.(pdf|docx?)", driver.current_url, re.IGNORECASE):
+                urls.append(driver.current_url)
+            urls += [urljoin(driver.current_url, l) for l in links_de_archivos(driver.page_source)]
+            driver.close()
+        driver.switch_to.window(ventana_original)
+        nuevos = links_de_archivos(driver.page_source) - links_antes
+        urls += [urljoin(driver.current_url, l) for l in nuevos]
+    except Exception as e:
+        print(f"    Error abriendo archivos {id_archivo}: {e}")
+        try:
+            driver.switch_to.window(ventana_original)
+        except Exception:
+            pass
+
+    sesion = requests.Session()
+    for c in driver.get_cookies():
+        sesion.cookies.set(c["name"], c["value"])
+    textos, primero_bytes, primero_url = [], None, ""
+    vistos = set()
+    for u in urls[:5]:
+        if u in vistos:
+            continue
+        vistos.add(u)
+        try:
+            r = sesion.get(u, timeout=20, headers={"User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"})
+            if r.status_code == 200:
+                t = extraer_texto_archivo(r.content)
+                if t:
+                    textos.append(t)
+                    if primero_bytes is None:
+                        primero_bytes, primero_url = r.content, u
+        except Exception as e:
+            print(f"    No se pudo bajar {u}: {e}")
+    print(f"    Archivos leidos para {id_archivo}: {len(textos)} (links: {len(vistos)})")
+    return " ".join(textos), primero_bytes, primero_url
+
 def obtener_compras(driver, nombre, url, par):
     print(f"\n--- {nombre} ---")
     resultados = []
@@ -139,6 +210,7 @@ def obtener_compras(driver, nombre, url, par):
         filas = driver.find_elements(By.TAG_NAME, "tr")
         print(f"  Total filas: {len(filas)}")
 
+        docs_leidos = 0
         for i, fila in enumerate(filas):
             texto_fila = fila.text.strip()
             if len(texto_fila) < 10:
@@ -159,51 +231,19 @@ def obtener_compras(driver, nombre, url, par):
             # Buscar palabras clave en el texto de la fila
             productos = detectar_productos(texto_fila)
 
-            # Si no encontro en la fila pero tiene ID, leer el documento
-            if not productos and id_archivo:
-                try:
-                    # Abrir la pagina de archivos para obtener el link real al PDF
-                    url_archivos = f"https://prestadores.pami.org.ar/compras_ver_archivos.php?id={id_archivo}"
-                    r_archivos = requests.get(url_archivos, timeout=15, headers={
-                        "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
-                    })
-                    texto_buscar = ""
-                    if r_archivos.status_code == 200:
-                        html_archivos = r_archivos.text
-                        # Buscar links a PDFs en la pagina
-                        links_pdf = re.findall(r'https://institucional[.]pami[.]org[.]ar[^\s"]*[.]pdf', html_archivos, re.IGNORECASE)
-                        for link_pdf in links_pdf:
-                            if not link_pdf.startswith("http"):
-                                link_pdf = "https://institucional.pami.org.ar/" + link_pdf.lstrip("/")
-                            try:
-                                r_pdf = requests.get(link_pdf, timeout=15, headers={
-                                    "User-Agent": "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36"
-                                })
-                                if r_pdf.status_code == 200:
-                                    ct = r_pdf.headers.get("Content-Type","")
-                                    if "pdf" in ct.lower():
-                                        try:
-                                            from pdfminer.high_level import extract_text as pdf_extract
-                                            texto_buscar = pdf_extract(io.BytesIO(r_pdf.content))
-                                        except:
-                                            texto_buscar = r_pdf.content.decode("latin-1", errors="ignore")
-                                    else:
-                                        texto_buscar = re.sub(r'<[^>]+>', ' ', r_pdf.text)
-                                    break
-                            except:
-                                pass
-                        # Si no encontro PDF, buscar en el HTML de la pagina de archivos
-                        if not texto_buscar:
-                            texto_buscar = re.sub(r'<[^>]+>', ' ', html_archivos)
-                    
-                    if texto_buscar:
-                        texto_buscar = re.sub(r'\s+', ' ', texto_buscar).strip()
-                        productos = detectar_productos(texto_buscar)
-                        if productos:
-                            print(f"  Encontrado en documento {id_archivo}: {', '.join(productos)}")
-                            texto_fila = texto_fila + " " + texto_buscar[:500]
-                except Exception as e:
-                    print(f"  Error leyendo doc {id_archivo}: {e}")
+            # Si la fila es generica (ej: solo dice "CIRUGIA INTERVENCIONISTA"),
+            # abrir el ojo y leer el pliego adentro
+            pdf_fallback = None
+            link_fallback = ""
+            texto_norm_fila = normalizar(texto_fila)
+            es_generica = any(g in texto_norm_fila for g in RUBROS_GENERICOS)
+            if not productos and id_archivo and es_generica and docs_leidos < MAX_DOCS_POR_CORRIDA:
+                docs_leidos += 1
+                texto_doc, pdf_fallback, link_fallback = leer_documentos_fila(driver, id_archivo)
+                if texto_doc:
+                    productos = detectar_productos(texto_doc)
+                    if productos:
+                        print(f"  Encontrado dentro del documento {id_archivo}: {', '.join(productos)}")
 
             if not productos:
                 continue
@@ -300,6 +340,10 @@ def obtener_compras(driver, nombre, url, par):
                             print(f"  ✅ Archivo descargado: {len(pdf_bytes)} bytes, tipo: {ct}")
                 except Exception as e:
                     print(f"  Error descargando: {e}")
+
+            if pdf_fallback and not pdf_bytes:
+                pdf_bytes = pdf_fallback
+                link_final = link_fallback or link_final
 
             # Si no pudimos descargar, al menos guardamos el link
             if not link_final:
